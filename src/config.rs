@@ -1,31 +1,26 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+// src/config.rs
+use crate::protocols::Proxy;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use std::fs;
 
 #[derive(Debug, Deserialize)]
-struct Config {
-    router: RouterConfig,
-    proxy: Vec<ProxyConfig>,
+pub struct Config {
+    pub router: RouterConfig,
+    pub proxy: Vec<ProxyConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RouterConfig {
-    listen: String,
+    pub listen: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
-    pub proxy_type: ProxyType,
+    pub proxy_type: Proxy,
     pub address: String,
     pub username: Option<String>,
     pub password: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub enum ProxyType {
-    Socks5,
-    Http,
-    Https,
 }
 
 impl ProxyConfig {
@@ -52,7 +47,6 @@ pub fn load_config(path: &str) -> Result<(String, Vec<ProxyConfig>), Box<dyn std
     Ok((config.router.listen, proxy_chain))
 }
 
-// Update base64 encoding function
 pub fn encode_auth(username: &str, password: &str) -> String {
     STANDARD.encode(format!("{}:{}", username, password))
 }
