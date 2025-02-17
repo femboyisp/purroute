@@ -88,7 +88,7 @@ impl ProxyServer {
     ) -> Result<(), ProxyError> {
         let global_stats = get_global_stats();
         // Clone the data we need to move into the spawned task
-        let proxy_chain = self.proxy.clone();
+        let proxy = self.proxy.clone();
         let server = self.clone();
 
         // Use tokio::spawn to ensure cleanup happens even if the task is cancelled
@@ -104,7 +104,7 @@ impl ProxyServer {
                     protocol, peer_addr
                 ));
 
-                let target_proxy = proxy_chain.first().ok_or_else(|| {
+                let target_proxy = proxy.first().ok_or_else(|| {
                     ProxyError::Protocol("No proxy configuration available".to_string())
                 })?;
 
@@ -172,14 +172,6 @@ impl ProxyServer {
                 }
             }
             .await;
-
-            if let Err(e) = &result {
-                global_stats.record_connection_result(
-                    false,
-                    format!("Connection error from {}: {}", peer_addr, e),
-                );
-                global_stats.decrement_active_connections();
-            }
 
             result
         });
