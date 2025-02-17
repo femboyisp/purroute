@@ -38,6 +38,13 @@ impl GlobalStats {
             log_tx,
         }
     }
+    pub fn increment_successful_connections(&self) {
+        self.succeeded_connections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn increment_failed_connections(&self) {
+        self.failed_connections.fetch_add(1, Ordering::SeqCst);
+    }
 
     pub fn increment_active_connections(&self) {
         self.active_connections.fetch_add(1, Ordering::SeqCst);

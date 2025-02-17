@@ -17,6 +17,7 @@ pub struct RouterConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
+    pub label: Option<String>,
     pub proxy_type: Proxy,
     pub address: String,
     pub username: Option<String>,
@@ -26,6 +27,7 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     fn to_proxy_config(&self) -> ProxyConfig {
         ProxyConfig {
+            label: self.label.clone(),
             proxy_type: self.proxy_type.clone(),
             address: self.address.clone(),
             username: self.username.clone(),

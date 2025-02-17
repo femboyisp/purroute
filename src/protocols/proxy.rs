@@ -11,12 +11,11 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
 };
 
 use crate::{
     config::ProxyConfig,
-    protocols::{Http, Socks5},
+    protocols::{Http, Https, Socks5},
     stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
 
@@ -36,7 +35,7 @@ pub enum ProxyError {
     #[error("Protocol error: {0}")]
     Protocol(String),
     #[error("Timeout error")]
-    Timeout,
+    Timeout, // do we even want to support timeouts?
     #[error("Unsupported protocol")]
     UnsupportedProtocol,
 }
@@ -63,6 +62,9 @@ impl ProxyServer {
         loop {
             let (socket, peer_addr) = listener.accept().await?;
             let global_stats = global_stats.clone();
+
+            // Increment active connections as soon as we accept a new connection
+            global_stats.increment_active_connections();
             global_stats.log_info(format!("New connection from {}", peer_addr));
 
             let server = self.clone();
@@ -72,6 +74,8 @@ impl ProxyServer {
                         false,
                         format!("Connection error from {}: {}", peer_addr, e),
                     );
+                    // Ensure we decrement on error
+                    global_stats.decrement_active_connections();
                 }
             });
         }
@@ -83,114 +87,107 @@ impl ProxyServer {
         peer_addr: SocketAddr,
     ) -> Result<(), ProxyError> {
         let global_stats = get_global_stats();
-        global_stats.increment_active_connections();
+        // Clone the data we need to move into the spawned task
+        let proxy_chain = self.proxy.clone();
+        let server = self.clone();
 
-        let result = async {
-            let mut buf = vec![0u8; 8192];
-            let n = client.read(&mut buf).await?;
-            let initial_request = buf[..n].to_vec();
+        // Use tokio::spawn to ensure cleanup happens even if the task is cancelled
+        let handle = tokio::spawn(async move {
+            let result = async {
+                let mut buf = vec![0u8; 8192];
+                let n = client.read(&mut buf).await?;
+                let initial_request = buf[..n].to_vec();
 
-            let protocol = self.detect_protocol(&initial_request)?;
-            global_stats.log_info(format!(
-                "Protocol {:?} detected from {}",
-                protocol, peer_addr
-            ));
+                let protocol = server.detect_protocol(&initial_request)?;
+                global_stats.log_info(format!(
+                    "Protocol {:?} detected from {}",
+                    protocol, peer_addr
+                ));
 
-            let target_proxy = self.proxy.first().ok_or_else(|| {
-                ProxyError::Protocol("No proxy configuration available".to_string())
-            })?;
+                let target_proxy = proxy_chain.first().ok_or_else(|| {
+                    ProxyError::Protocol("No proxy configuration available".to_string())
+                })?;
 
-            // Create a notification channel with a larger buffer
-            let (success_tx, mut success_rx) = mpsc::channel(32);
-
-            // Spawn a task to handle the success notification
-            let stats = global_stats.clone();
-            let peer = peer_addr;
-            let notification_task = tokio::spawn(async move {
-                if success_rx.recv().await.is_some() {
-                    stats.log_info(format!("Connection established successfully for {}", peer));
-                }
-            });
-
-            let handle_result = match protocol {
-                Proxy::Socks5 => {
-                    let tx = success_tx.clone();
-                    let stats = global_stats.clone();
-                    Socks5::handle(
-                        client,
-                        &target_proxy.address,
-                        initial_request,
-                        target_proxy,
-                        move |client, upstream, _| {
-                            let server = self.clone();
-                            let peer = peer_addr;
-                            let stats = stats.clone();
-                            Box::pin({
-                                let tx = tx.clone();
-                                async move {
-                                    // Send success notification immediately after connection
-                                    let _ = tx.send(()).await;
+                match protocol {
+                    Proxy::Socks5 => {
+                        Socks5::handle(
+                            client,
+                            &target_proxy.address,
+                            initial_request,
+                            target_proxy,
+                            move |client, upstream, stats| {
+                                let server = server.clone();
+                                let peer = peer_addr;
+                                Box::pin(async move {
+                                    stats.record_connection_result(
+                                        true,
+                                        format!("Socks5 Connection successful for {}", peer_addr),
+                                    );
                                     server.proxy_data(client, upstream, peer, stats).await
-                                }
-                            })
-                        },
-                    )
-                    .await
-                }
-                Proxy::Http | Proxy::Https => {
-                    let tx = success_tx.clone();
-                    let stats = global_stats.clone();
-                    Http::handle(
-                        client,
-                        &target_proxy.address,
-                        initial_request,
-                        protocol == Proxy::Https,
-                        target_proxy,
-                        move |client, upstream, _| {
-                            let server = self.clone();
-                            let peer = peer_addr;
-                            let stats = stats.clone();
-                            Box::pin({
-                                let tx = tx.clone();
-                                async move {
-                                    // Send success notification immediately after connection
-                                    let _ = tx.send(()).await;
-                                    server.proxy_data(client, upstream, peer, stats).await
-                                }
-                            })
-                        },
-                    )
-                    .await
-                }
-            };
-
-            // Wait for either an error or connection completion
-            tokio::select! {
-                res = notification_task => {
-                    if let Err(e) = res {
-                        global_stats.record_connection_result(
-                            false,
-                            format!("Notification error for {}: {}", peer_addr, e),
-                        );
+                                })
+                            },
+                        )
+                        .await
                     }
-                }
-                res = async { handle_result } => {
-                    if let Err(e) = res {
-                        global_stats.record_connection_result(
-                            false,
-                            format!("Connection failed for {}: {}", peer_addr, e),
-                        );
-                        return Err(e);
+                    Proxy::Http => {
+                        Http::handle(
+                            client,
+                            &target_proxy.address,
+                            initial_request,
+                            target_proxy,
+                            move |client, upstream, stats| {
+                                let server = server.clone();
+                                let peer = peer_addr;
+                                Box::pin(async move {
+                                    stats.record_connection_result(
+                                        true,
+                                        format!("HTTP Connection successful for {}", peer_addr),
+                                    );
+                                    server.proxy_data(client, upstream, peer, stats).await
+                                })
+                            },
+                        )
+                        .await
+                    }
+                    Proxy::Https => {
+                        Https::handle(
+                            client,
+                            &target_proxy.address,
+                            initial_request,
+                            target_proxy,
+                            move |client, upstream, stats| {
+                                let server = server.clone();
+                                let peer = peer_addr;
+                                Box::pin(async move {
+                                    stats.record_connection_result(
+                                        true,
+                                        format!("HTTPS Connection successful for {}", peer_addr),
+                                    );
+                                    server.proxy_data(client, upstream, peer, stats).await
+                                })
+                            },
+                        )
+                        .await
                     }
                 }
             }
+            .await;
 
-            Ok(())
-        }
-        .await;
+            if let Err(e) = &result {
+                global_stats.record_connection_result(
+                    false,
+                    format!("Connection error from {}: {}", peer_addr, e),
+                );
+                global_stats.decrement_active_connections();
+            }
 
-        global_stats.decrement_active_connections();
-        result
+            result
+        });
+
+        // Wait for the handle and propagate any errors
+        handle
+            .await
+            .unwrap_or_else(|e| Err(ProxyError::Protocol(e.to_string())))
     }
 
     pub fn detect_protocol(&self, request: &[u8]) -> Result<Proxy, ProxyError> {
@@ -221,7 +218,7 @@ impl ProxyServer {
         {
             Ok(Proxy::Http)
         } else {
-            Err(ProxyError::Protocol("Unknown protocol".into()))
+            Err(ProxyError::UnsupportedProtocol)
         }
     }
 
@@ -235,75 +232,83 @@ impl ProxyServer {
         let (mut client_reader, mut client_writer) = client.split();
         let (mut upstream_reader, mut upstream_writer) = upstream.split();
 
+        // Create channels to signal when either stream ends
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+
         let client_to_upstream = async {
             let mut buf = [0u8; 8192];
-            loop {
+            let result = loop {
                 match client_reader.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
                         stats.add_bytes_out(n as u64);
                         if let Err(e) = upstream_writer.write_all(&buf[..n]).await {
-                            stats.record_connection_result(
-                                false,
-                                format!("Error writing to upstream for {}: {}", peer_addr, e),
-                            );
-                            break;
+                            stats.log_info(format!(
+                                "Error writing to upstream for {}: {}",
+                                peer_addr, e
+                            ));
+                            break Err(ProxyError::Io(e));
                         }
                         if let Err(e) = upstream_writer.flush().await {
-                            stats.record_connection_result(
-                                false,
-                                format!("Error flushing upstream for {}: {}", peer_addr, e),
-                            );
-                            break;
+                            stats.log_info(format!(
+                                "Error flushing upstream for {}: {}",
+                                peer_addr, e
+                            ));
+                            break Err(ProxyError::Io(e));
                         }
                     }
                     Err(e) => {
-                        stats.record_connection_result(
-                            false,
-                            format!("Error reading from client {}: {}", peer_addr, e),
-                        );
-                        break;
+                        stats.log_info(format!("Error reading from client {}: {}", peer_addr, e));
+                        break Err(ProxyError::Io(e));
                     }
                 }
-            }
-            Ok::<(), ProxyError>(())
+            };
+            let _ = tx1.send(()); // Signal that this stream has ended
+            result
         };
 
         let upstream_to_client = async {
             let mut buf = [0u8; 8192];
-            loop {
+            let result = loop {
                 match upstream_reader.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
                         stats.add_bytes_in(n as u64);
                         if let Err(e) = client_writer.write_all(&buf[..n]).await {
-                            stats.record_connection_result(
-                                false,
-                                format!("Error writing to client {}: {}", peer_addr, e),
-                            );
-                            break;
+                            stats.log_info(format!("Error writing to client {}: {}", peer_addr, e));
+                            break Err(ProxyError::Io(e));
                         }
                         if let Err(e) = client_writer.flush().await {
-                            stats.record_connection_result(
-                                false,
-                                format!("Error flushing client {}: {}", peer_addr, e),
-                            );
-                            break;
+                            stats.log_info(format!("Error flushing client {}: {}", peer_addr, e));
+                            break Err(ProxyError::Io(e));
                         }
                     }
                     Err(e) => {
-                        stats.record_connection_result(
-                            false,
-                            format!("Error reading from upstream for {}: {}", peer_addr, e),
-                        );
-                        break;
+                        stats.log_info(format!(
+                            "Error reading from upstream for {}: {}",
+                            peer_addr, e
+                        ));
+                        break Err(ProxyError::Io(e));
                     }
                 }
-            }
-            Ok::<(), ProxyError>(())
+            };
+            let _ = tx2.send(()); // Signal that this stream has ended
+            result
         };
 
-        tokio::try_join!(client_to_upstream, upstream_to_client)?;
-        Ok(())
+        // Wait for either stream to end
+        let result = tokio::select! {
+            r1 = client_to_upstream => r1,
+            r2 = upstream_to_client => r2,
+            _ = rx1 => Ok(()),
+            _ = rx2 => Ok(()),
+        };
+
+        // Always decrement active connections when connection ends
+        stats.decrement_active_connections();
+        stats.log_info(format!("Connection closed for {}", peer_addr));
+
+        result
     }
 }
