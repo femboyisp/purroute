@@ -1,0 +1,27 @@
+[package]
+description = ""
+documentation = "https://docs.rs/purroute"
+edition = "2021"
+license = "MIT"
+name = "purroute"
+repository = "https://github.com/FemboyISP/purroute"
+version = "0.1.0"
+
+
+[dependencies]
+base64 = "0.22.1"
+bytes = "1.10.0"
+criterion = "0.5"
+dashmap = "6.1.0"
+futures = "0.3.31"
+libc = "0.2.169"
+metrics = "0.24.1"
+metrics-exporter-log = "0.4.0"
+metrics-exporter-prometheus = "0.16.2"
+serde = { version = "1.0.217", features = ["derive"] }
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-tungstenite = "0.26.1"
+tokio-util = "0.7"
+toml = "0.8.20"
+url = "2.5.4"

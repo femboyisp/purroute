@@ -1,0 +1,136 @@
+### Proxy Configuration
+# This is an example configuration file for the Purroute proxy router
+[router]
+listen = "127.0.0.1:1337"                        # Address and port for the router to listen on. Can be an array of addresses:ports or a single address:port (ie: ["[::]:1337", "10.13.37.1:1337"]
+enable = ["Http|Https", "Socks4", "Socks5"]      # (Optional) Supported protocols for the router (ie: Http, Https, Socks4, Socks5). If not specified then all protocols are enabled
+tls = false                                      # (Optional) Enable TLS for the router (required for Https protocol)
+tls_cert = "/path/to/cert.pem"                   # (Optional) Path to TLS certificate file
+tls_key = "/path/to/key.pem"                     # (Optional) Path to TLS key file
+tls_ca = "/path/to/ca.pem"                       # (Optional) Path to TLS CA file
+debug = false                                    # (Optional) Enable debug logging
+verbose = false                                  # (Optional) Enable verbose logging
+stats = true                                     # (Optional) Enable statistics tracking
+auth = true                                      # (Optional) Enable proxy authentication to connect to proxies.
+
+# (Optional) Authentication settings
+[router.auth]
+database = "/path/to/auth.db"                    # (Optional) Path to the authentication database file
+bandwidth = true                                 # (Optional) Enable bandwidth tracking for authenticated users
+unauthenticated = false                          # (Optional) Allow unauthenticated connections to the router (default is false else needs to be a label ie: unauthenticated = "scraped")
+
+
+# Global proxy settings
+[proxy.global]
+interface = "eth0"                              # Default interface for all proxies. This can be an ip address or interface.
+allow_translations = true                       # Enable proxy protocol translations. Can be overridden by individual proxies
+translation_pairs = [                           # (Optional) Specific protocol translation pairs if allow_translations is True. Can be overridden by individual proxies
+    ["Http", "Socks5"],                         # Translates Protocol From => To (ie: Http => Socks5 will allow translate Http to Socks5)
+    ["Socks4", "Http"],                         # Globally can be configured to translate all protocols if translation_pairs is not specified
+    ["Socks4", "Socks5"],                       # Individual proxies can override this setting
+]                                               # Same protocol translations (ie: Socks5 => Socks5) translations are not allowed as they do not need to translate
+# (Optional) Global proxy chaining settings
+[proxy.global.chaining]                         # If False or Not specified then the order is by the translation pairs.
+chaining = true                                 # (Optional) Enable proxy chaining
+order = "random"                                # Default order for proxy chains. ("random" = randomized order, "sequential" = in order listed or defined by individual proxies), overridden globally by first or individually by after/order
+first = "tor"                                   # (Optional) Will be used before any other proxies, this can be overridden by individual proxies/lists with "after". (ie: first = "label")
+
+# Proxy builder configuration (Local Proxies)
+[[router.proxy]]                                # Each [[router.proxy]] block defines a locally built proxy
+label = "datacenter"                            # (Optional) Custom label for this built proxy
+proxy_type = "Socks5"                           # (Optional) Type of proxy to allow (Http, Https, Socks4, Socks4a, Socks5) if not specified then all are allowed. Can be Single or Array (ie: proxy_type = ["Http", "Socks5"])
+interface = "192.168.1.0/24"                    # Interface, IP address, or IP Range/CIDR to use for outgoing connections can be a single IP or a range or cidr notation (ie: 10.13.37.69, 10.13.37.100-10.13.37.200, 10.13.37.0/24, eth1). Can be by itself or in an Array (ie: interface = ["10.13.37.100-10.13.37.200", "192.168.69.100-192.168.69.200"])
+
+# Individual proxy configurations (External Connections)
+[[proxy]]                                       # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration
+label = "tor"                                   # (Optional) Custom label for this Proxy
+proxy_type = "Socks5"                           # Proxy types supported: Http, Https, Http|Https, Socks4, Socks4a, Socks5
+address = "127.0.0.1:9050"                      # If port is not specified (ie: in onion/i2p addresses) we default to 80
+username = "user123"                            # (Optional) Username for proxy authentication
+password = "pass456"                            # (Optional) Password for proxy authentication
+order = 1                                       # (Optional) Order in proxy chain ie: 1 -> 2 -> 3, etc
+
+[[proxy]]
+label = "corporate"                             # (Optional) Custom label for this Proxy
+proxy_type = "Http|Https"                       # If just Http or Https is specified then it will be strictly that protocol
+address = "proxy2.example.com:8080"
+order = 2                                       # Order in chain
+failover = true                                 # Enable failover to next proxy if this fails. Can also be a label
+interface = "tun0"                              # (Optional) Specific interface or interface IP override for this proxy
+
+[[proxy]]
+proxy_type = "Socks4a"
+address = "proxy3.example.com:1081"             # If port is not specified (ie: in onion/i2p addresses) we default to 80
+order = "random"                                # Random position in chain
+after = "tor"                                   # Will be used after the proxy with the label "tor"
+
+# Proxy list configuration
+[[proxy.list]]
+proxy_type = "Http"                             # (Optional) Proxy type in lists can be unspecified if the protocol is specified in the list file, otherwise all proxies in the list will be used as the proxy_type specified, if any protocol is in scheme then it will only use the proxy type specified
+list_path = "/path/to/http_list.txt"            # File with proxy addresses (one per line) and separators will be automatically detected (ie: "addr:port:user:pass", "http://user:pass@addr:port", tabs, spaces, colons, commas, slashes, etc)
+list_order = "random"                           #  (sequential will use the order in the list file)
+scheme = ["user", "pass", "addr", "port"]       # Scheme for parsing the list file. Supported values: user, pass, addr, port, protocol(optional)
+interface = "eth1"                              # Interface or Interface IP address override for this list
+# (Optional) Proxy list testing settings
+testing_enabled = true                          # Enable proxy testing, if false or not specified then all proxies in list are considered valid and used
+test_url = "http://example.com"                 # (Optional) test via to use for testing proxies
+test_timeout = 5                                # Timeout in seconds for testing proxies
+test_times = 3                                  # (Optional) Number of times to test each proxy. Default is 1
+max_failures = 3                                # Max failures before removing from list
+anonymity_levels = ["ELITE", "ANONYMOUS"]       # (Optional) Anonymity levels to use for the tested proxies (ie: ELITE, ANONYMOUS, TRANSPARENT). If not specified then all working proxies are used
+after = "tor"                                   # (Optional) Will be used after the proxy with the label "tor"
+
+[[proxy.list]]
+proxy_type = "Socks5" # Proxy type
+list_path = "/path/to/socks5_list.txt"
+testing_enabled = true
+anonymity_levels = ["ELITE"]
+usage_mode = "sequential"
+test_timeout = 10 # Seconds to wait during testing
+
+# Proxy scrape configuration
+[[proxy.list]]
+# (Optional) Proxy scraper configuration
+[[proxy.scrape]]
+label = "scraped"                               # (Optional) Custom label for scraped proxies
+proxy_type = ["Http", "Socks5"]                 # Types of proxies to scrape
+sources = [                                     # List of proxy scraping sources
+    "https://example.com/proxy-list",           # URL to scrape proxies from
+    "https://another-source.com/proxies",       # Can be a single URL or an array of URLs
+    {                                           # API source configuration
+        type = "api",                           # Source type (api, txt, raw)
+        url = "https://api.proxyscrape.com",
+        params = {                              # API parameters
+            "request": "displayproxies",
+            "protocol": "http",
+            "timeout": "10000",
+            "apikey": "YOUR_API_KEY"
+        }
+    },
+    {                                          # Plain text file source
+        type = "txt",
+        url = "https://example.com/proxies.txt",
+        format = "ip:port"                     # Format specification for parsing
+    },
+    {                                          # Raw HTTP source with authentication
+        type = "raw",
+        url = "https://premium-proxies.com/list",
+        auth = {
+            username = "user",
+            password = "pass"
+        },
+        headers = {                            # Custom headers if needed
+            "User-Agent" = "Custom/1.0"
+        }
+    }
+]
+scrape_interval = 3600                          # Interval in seconds between scrapes
+testing_enabled = true                          # Enable testing of scraped proxies
+test_proxy = true                               # Test the proxy before adding to the list
+test_url = "https://example.com"                # URL to test proxies against
+test_timeout = 10                               # Timeout in seconds for testing
+test_times = 2                                  # Number of times to test each proxy
+max_failures = 3                                # Maximum failures before removing proxy
+anonymity_levels = ["ELITE", "ANONYMOUS"]       # Required anonymity levels for proxies to use (ie: ELITE, ANONYMOUS, TRANSPARENT)
+interface = "eth0"                              # (Optional) Interface to use for scraping/testing
+order = "random"                                # Order to use proxies in chain
+after = "tor"                                   # (Optional) Use after specified proxy label
