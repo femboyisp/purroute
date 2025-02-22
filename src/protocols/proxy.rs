@@ -5,18 +5,18 @@
 /// The server reads the PROXY header and uses the client's IP address and port number to establish a connection to the client.
 /// The server then forwards the client's request to the destination server.
 // src/protocols/proxy.rs
+use crate::{
+    config::{ProxyConfig, RouterConfig},
+    protocols::{Http, Https, Socks5},
+    stats::{get_global_stats, GlobalStats, StatsDisplay},
+};
+use base64::Engine;
 use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-};
-
-use crate::{
-    config::ProxyConfig,
-    protocols::{Http, Https, Socks5},
-    stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -35,7 +35,7 @@ pub enum ProxyError {
     #[error("Protocol error: {0}")]
     Protocol(String),
     #[error("Timeout error")]
-    Timeout, // do we even want to support timeouts?
+    Timeout,
     #[error("Unsupported protocol")]
     UnsupportedProtocol,
 }
@@ -44,20 +44,26 @@ pub enum ProxyError {
 pub struct ProxyServer {
     proxy: Arc<Vec<ProxyConfig>>,
     logger: Arc<StatsDisplay>,
+    config: Arc<RouterConfig>,
 }
 
 impl ProxyServer {
-    pub fn new(proxy: Vec<ProxyConfig>, logger: Arc<StatsDisplay>) -> Self {
+    pub fn new(
+        proxy: Vec<ProxyConfig>,
+        logger: Arc<StatsDisplay>,
+        config: Arc<RouterConfig>,
+    ) -> Self {
         Self {
             proxy: Arc::new(proxy),
             logger,
+            config,
         }
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
         let listener = TcpListener::bind(addr).await?;
         let global_stats = get_global_stats();
-        global_stats.log_info(format!("Proxy server listening on {}", addr));
+        global_stats.log_info(format!("Proxy server listening on {}", addr), &self.config);
 
         loop {
             let (socket, peer_addr) = listener.accept().await?;
@@ -65,14 +71,16 @@ impl ProxyServer {
 
             // Increment active connections as soon as we accept a new connection
             global_stats.increment_active_connections();
-            global_stats.log_info(format!("New connection from {}", peer_addr));
+            global_stats.log_info(format!("New connection from {}", peer_addr), &self.config);
 
             let server = self.clone();
+            let label = server.proxy.first().and_then(|config| config.label.clone());
             tokio::spawn(async move {
-                if let Err(e) = server.handle_connection(socket, peer_addr).await {
+                if let Err(e) = server.handle_connection(socket, peer_addr, label).await {
                     global_stats.record_connection_result(
                         false,
                         format!("Connection error from {}: {}", peer_addr, e),
+                        &server.config,
                     );
                     // Ensure we decrement on error
                     global_stats.decrement_active_connections();
@@ -85,6 +93,7 @@ impl ProxyServer {
         &self,
         mut client: TcpStream,
         peer_addr: SocketAddr,
+        label: Option<String>,
     ) -> Result<(), ProxyError> {
         let global_stats = get_global_stats();
         // Clone the data we need to move into the spawned task
@@ -99,14 +108,24 @@ impl ProxyServer {
                 let initial_request = buf[..n].to_vec();
 
                 let protocol = server.detect_protocol(&initial_request)?;
-                global_stats.log_info(format!(
-                    "Protocol {:?} detected from {}",
-                    protocol, peer_addr
-                ));
+                global_stats.log_info(
+                    format!("Protocol {:?} detected from {}", protocol, peer_addr),
+                    &server.config,
+                );
 
                 let target_proxy = proxy.first().ok_or_else(|| {
                     ProxyError::Protocol("No proxy configuration available".to_string())
                 })?;
+
+                if let Some(label) = &label {
+                    global_stats.log_info(
+                        format!("Using proxy '{}' for connection from {}", label, peer_addr),
+                        &server.config,
+                    );
+                }
+
+                // Authenticate user
+                let user_account = server.authenticate_user(&initial_request).await?;
 
                 match protocol {
                     Proxy::Socks5 => {
@@ -122,8 +141,11 @@ impl ProxyServer {
                                     stats.record_connection_result(
                                         true,
                                         format!("Socks5 Connection successful for {}", peer_addr),
+                                        &server.config,
                                     );
-                                    server.proxy_data(client, upstream, peer, stats).await
+                                    server
+                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .await
                                 })
                             },
                         )
@@ -142,8 +164,11 @@ impl ProxyServer {
                                     stats.record_connection_result(
                                         true,
                                         format!("HTTP Connection successful for {}", peer_addr),
+                                        &server.config,
                                     );
-                                    server.proxy_data(client, upstream, peer, stats).await
+                                    server
+                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .await
                                 })
                             },
                         )
@@ -162,8 +187,11 @@ impl ProxyServer {
                                     stats.record_connection_result(
                                         true,
                                         format!("HTTPS Connection successful for {}", peer_addr),
+                                        &server.config,
                                     );
-                                    server.proxy_data(client, upstream, peer, stats).await
+                                    server
+                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .await
                                 })
                             },
                         )
@@ -214,12 +242,58 @@ impl ProxyServer {
         }
     }
 
+    pub async fn authenticate_user(&self, request: &[u8]) -> Result<Option<i64>, ProxyError> {
+        if let Some(auth) = self.config.auth {
+            if auth {
+                let request_str = String::from_utf8_lossy(request);
+                let auth_header = request_str
+                    .lines()
+                    .find(|line| {
+                        line.to_lowercase()
+                            .starts_with("proxy-authorization: basic ")
+                    })
+                    .ok_or(ProxyError::AuthFailed)?;
+
+                let encoded_credentials = auth_header[27..].trim();
+                let decoded_credentials = base64::engine::general_purpose::STANDARD
+                    .decode(encoded_credentials)
+                    .map_err(|_| ProxyError::AuthFailed)?;
+                let credentials =
+                    String::from_utf8(decoded_credentials).map_err(|_| ProxyError::AuthFailed)?;
+                let mut parts = credentials.split(':');
+                let username = parts.next().ok_or(ProxyError::AuthFailed)?;
+                let password = parts.next().ok_or(ProxyError::AuthFailed)?;
+
+                let query = "
+                    SELECT account
+                    FROM public.accounts
+                    WHERE username = $1 AND password = $2
+                ";
+
+                if let Some(db_client) = &self.config.db_client {
+                    if let Some(row) = db_client
+                        .query_opt(query, &[&username, &password])
+                        .await
+                        .map_err(|_| ProxyError::AuthFailed)?
+                    {
+                        return Ok(Some(row.get(0)));
+                    }
+                }
+
+                return Err(ProxyError::AuthFailed);
+            }
+        }
+
+        Ok(None)
+    }
+
     pub async fn proxy_data(
         &self,
         mut client: TcpStream,
         mut upstream: TcpStream,
         peer_addr: SocketAddr,
         stats: Arc<GlobalStats>,
+        user_account: Option<i64>,
     ) -> Result<(), ProxyError> {
         let (mut client_reader, mut client_writer) = client.split();
         let (mut upstream_reader, mut upstream_writer) = upstream.split();
@@ -235,23 +309,32 @@ impl ProxyServer {
                     Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
                         stats.add_bytes_out(n as u64);
+                        if let Some(account) = user_account {
+                            self.add_user_bytes_out(account, n as u64).await?;
+                        }
                         if let Err(e) = upstream_writer.write_all(&buf[..n]).await {
-                            stats.log_info(format!(
-                                "Error writing to upstream for {}: {}",
-                                peer_addr, e
-                            ));
+                            stats.record_connection_result(
+                                false,
+                                format!("Error writing to upstream for {}: {}", peer_addr, e),
+                                &self.config,
+                            );
                             break Err(ProxyError::Io(e));
                         }
                         if let Err(e) = upstream_writer.flush().await {
-                            stats.log_info(format!(
-                                "Error flushing upstream for {}: {}",
-                                peer_addr, e
-                            ));
+                            stats.record_connection_result(
+                                false,
+                                format!("Error flushing upstream for {}: {}", peer_addr, e),
+                                &self.config,
+                            );
                             break Err(ProxyError::Io(e));
                         }
                     }
                     Err(e) => {
-                        stats.log_info(format!("Error reading from client {}: {}", peer_addr, e));
+                        stats.record_connection_result(
+                            false,
+                            format!("Error reading from client {}: {}", peer_addr, e),
+                            &self.config,
+                        );
                         break Err(ProxyError::Io(e));
                     }
                 }
@@ -267,20 +350,32 @@ impl ProxyServer {
                     Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
                         stats.add_bytes_in(n as u64);
+                        if let Some(account) = user_account {
+                            self.add_user_bytes_in(account, n as u64).await?;
+                        }
                         if let Err(e) = client_writer.write_all(&buf[..n]).await {
-                            stats.log_info(format!("Error writing to client {}: {}", peer_addr, e));
+                            stats.record_connection_result(
+                                false,
+                                format!("Error writing to client {}: {}", peer_addr, e),
+                                &self.config,
+                            );
                             break Err(ProxyError::Io(e));
                         }
                         if let Err(e) = client_writer.flush().await {
-                            stats.log_info(format!("Error flushing client {}: {}", peer_addr, e));
+                            stats.record_connection_result(
+                                false,
+                                format!("Error flushing client {}: {}", peer_addr, e),
+                                &self.config,
+                            );
                             break Err(ProxyError::Io(e));
                         }
                     }
                     Err(e) => {
-                        stats.log_info(format!(
-                            "Error reading from upstream for {}: {}",
-                            peer_addr, e
-                        ));
+                        stats.record_connection_result(
+                            false,
+                            format!("Error reading from upstream for {}: {}", peer_addr, e),
+                            &self.config,
+                        );
                         break Err(ProxyError::Io(e));
                     }
                 }
@@ -299,8 +394,56 @@ impl ProxyServer {
 
         // Always decrement active connections when connection ends
         stats.decrement_active_connections();
-        stats.log_info(format!("Connection closed for {}", peer_addr));
+        stats.log_info(format!("Connection closed for {}", peer_addr), &self.config);
 
         result
+    }
+
+    async fn add_user_bytes_in(&self, account: i64, bytes: u64) -> Result<(), ProxyError> {
+        let query = "
+                UPDATE public.user_stats
+                SET total_bytes_in = total_bytes_in + $1
+                WHERE account = $2
+            ";
+
+        if let Some(db_client) = &self.config.db_client {
+            db_client
+                .execute(query, &[&(bytes as i64), &account])
+                .await
+                .map_err(|e| {
+                    ProxyError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
+        } else {
+            return Err(ProxyError::AuthFailed);
+        }
+
+        Ok(())
+    }
+
+    async fn add_user_bytes_out(&self, account: i64, bytes: u64) -> Result<(), ProxyError> {
+        let query = "
+                        UPDATE public.user_stats
+                        SET total_bytes_out = total_bytes_out + $1
+                        WHERE account = $2
+                    ";
+
+        if let Some(db_client) = &self.config.db_client {
+            db_client
+                .execute(query, &[&(bytes as i64), &account])
+                .await
+                .map_err(|e| {
+                    ProxyError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
+        } else {
+            return Err(ProxyError::AuthFailed);
+        }
+
+        Ok(())
     }
 }

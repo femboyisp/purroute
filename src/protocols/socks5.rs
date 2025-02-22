@@ -8,8 +8,9 @@
 /// and SOCKS5.
 // src/protocols/socks5.rs
 use crate::{
-    config::encode_auth, stats::get_global_stats, stats::global::GlobalStats, Proxy, ProxyConfig,
-    ProxyError,
+    config::{encode_auth, ProxyConfig},
+    stats::{get_global_stats, GlobalStats},
+    Proxy, ProxyError,
 };
 use std::sync::Arc;
 use tokio::{

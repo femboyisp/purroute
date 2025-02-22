@@ -1,8 +1,8 @@
 // src/protocols/https.rs
 use crate::{
-    config::encode_auth,
+    config::{encode_auth, ProxyConfig},
     stats::{get_global_stats, GlobalStats},
-    Proxy, ProxyConfig, ProxyError,
+    Proxy, ProxyError,
 };
 use std::sync::Arc;
 use tokio::{

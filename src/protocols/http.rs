@@ -2,9 +2,9 @@
 /// The HTTP proxy protocol is used to forward HTTP and HTTPS requests to an upstream proxy.
 // src/protocols/http.rs
 use crate::{
-    config::encode_auth,
+    config::{encode_auth, ProxyConfig},
     stats::{get_global_stats, GlobalStats},
-    Proxy, ProxyConfig, ProxyError,
+    Proxy, ProxyError,
 };
 use std::sync::Arc;
 use tokio::{

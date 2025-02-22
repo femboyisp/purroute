@@ -1,5 +1,8 @@
 [router]
 listen = "127.0.0.1:1337"                        # Address and port for the router to listen on. Can be an array of addresses:ports or a single address:port (ie: ["[::]:1337", "10.13.37.1:1337"]
+log = true                                       # D
+verbose = true
+debug = true
 
 # Individual proxy configurations (External Connections)
 [[proxy]]                                       # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration

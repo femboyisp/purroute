@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  db:
+    build: .
+    container_name: purroute_db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: purroute
+      POSTGRES_USER: purroute_user
+      POSTGRES_PASSWORD: purroute_password
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql

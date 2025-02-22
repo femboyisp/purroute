@@ -17,7 +17,9 @@ use tokio::{
     sync::broadcast,
     time::{interval, Duration, MissedTickBehavior},
 };
+use tokio_postgres::Client;
 
+use crate::config::RouterConfig;
 use crate::stats::{GlobalStats, GlobalStatsSnapshot};
 
 const MAX_LOG_LINES: usize = 10;
@@ -41,15 +43,17 @@ pub struct StatsDisplay {
     update_interval: Duration,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
     log_rx: broadcast::Receiver<(String, LogLevel)>,
+    db_client: Arc<Client>,
 }
 
 impl StatsDisplay {
-    pub fn new(stats: Arc<GlobalStats>, update_interval: Duration) -> Self {
+    pub fn new(stats: Arc<GlobalStats>, update_interval: Duration, db_client: Arc<Client>) -> Self {
         Self {
             stats: stats.clone(),
             update_interval,
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))),
             log_rx: stats.get_log_rx(),
+            db_client,
         }
     }
 
@@ -85,7 +89,11 @@ impl StatsDisplay {
         Ok(())
     }
 
-    fn print_log_entry(stdout: &mut Stdout, entry: &LogEntry) -> std::io::Result<()> {
+    fn print_log_entry(
+        stdout: &mut Stdout,
+        entry: &LogEntry,
+        config: &RouterConfig,
+    ) -> std::io::Result<()> {
         let color = match entry.level {
             LogLevel::Info => Color::Blue,
             LogLevel::Error => Color::Red,
@@ -96,49 +104,49 @@ impl StatsDisplay {
             .map(|dt| dt.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "??:??:??".to_string());
 
-        stdout
-            .queue(SetForegroundColor(Color::DarkGrey))?
-            .queue(Print(format!("[{}] ", timestamp)))?
-            .queue(SetForegroundColor(color))?
-            .queue(Print(&entry.message))?
-            .queue(Print("\n"))?;
+        if let Some(log) = config.log {
+            if log {
+                match entry.level {
+                    LogLevel::Info => {
+                        if config.verbose.unwrap_or(false) || config.debug.unwrap_or(false) {
+                            stdout
+                                .queue(SetForegroundColor(Color::DarkGrey))?
+                                .queue(Print(format!("[{}] ", timestamp)))?
+                                .queue(SetForegroundColor(color))?
+                                .queue(Print(&entry.message))?
+                                .queue(Print("\n"))?;
+                        }
+                    }
+                    LogLevel::Error => {
+                        stdout
+                            .queue(SetForegroundColor(Color::DarkGrey))?
+                            .queue(Print(format!("[{}] ", timestamp)))?
+                            .queue(SetForegroundColor(color))?
+                            .queue(Print(&entry.message))?
+                            .queue(Print("\n"))?;
+                    }
+                    LogLevel::Success => {
+                        if config.verbose.unwrap_or(false) {
+                            stdout
+                                .queue(SetForegroundColor(Color::DarkGrey))?
+                                .queue(Print(format!("[{}] ", timestamp)))?
+                                .queue(SetForegroundColor(color))?
+                                .queue(Print(&entry.message))?
+                                .queue(Print("\n"))?;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
-    pub async fn run(mut self) -> Result<()> {
-        let mut stdout = stdout();
-        let mut interval = interval(self.update_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        stdout.queue(cursor::Hide)?;
-
-        loop {
-            interval.tick().await;
-
-            // Process any new logs
-            while let Ok((message, level)) = self.log_rx.try_recv() {
-                if let Ok(mut logs) = self.logs.lock() {
-                    if logs.len() >= MAX_LOG_LINES {
-                        logs.pop_front();
-                    }
-                    logs.push_back(LogEntry {
-                        timestamp: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        message,
-                        level,
-                    });
-                }
-            }
-
-            // Update display
-            let stats = self.stats.get_stats();
-            self.refresh_display(&stats)?;
-        }
-    }
-
-    fn refresh_display(&self, stats: &GlobalStatsSnapshot) -> std::io::Result<()> {
+    fn refresh_display(
+        &self,
+        stats: &GlobalStatsSnapshot,
+        config: &RouterConfig,
+    ) -> std::io::Result<()> {
         let mut stdout = stdout();
 
         stdout
@@ -216,7 +224,7 @@ impl StatsDisplay {
 
         if let Ok(logs) = self.logs.lock() {
             for entry in logs.iter() {
-                Self::print_log_entry(&mut stdout, entry)?;
+                Self::print_log_entry(&mut stdout, entry, config)?;
             }
         }
 
@@ -226,6 +234,72 @@ impl StatsDisplay {
             .queue(Print("Press Ctrl+C to exit"))?;
 
         stdout.flush()?;
+        Ok(())
+    }
+
+    pub async fn run(mut self, config: Arc<RouterConfig>) -> Result<()> {
+        let mut stdout = stdout();
+        let mut interval = interval(self.update_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        stdout.queue(cursor::Hide)?;
+
+        loop {
+            interval.tick().await;
+
+            // Process any new logs
+            while let Ok((message, level)) = self.log_rx.try_recv() {
+                if let Ok(mut logs) = self.logs.lock() {
+                    if logs.len() >= MAX_LOG_LINES {
+                        logs.pop_front();
+                    }
+                    logs.push_back(LogEntry {
+                        timestamp: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        message,
+                        level,
+                    });
+                }
+            }
+
+            let stats = self.stats.get_stats();
+
+            // Update display
+            self.refresh_display(&stats, &config)?;
+
+            // Record statistics in the database
+            self.record_stats_in_db(&stats).await?;
+        }
+    }
+
+    async fn record_stats_in_db(&self, stats: &GlobalStatsSnapshot) -> Result<()> {
+        let query = "
+            UPDATE public.global
+            SET
+                total_connections = $1,
+                succeeded_connections = $2,
+                failed_connections = $3,
+                total_bytes_in = $4,
+                total_bytes_out = $5
+            WHERE id = 1
+        ";
+
+        self.db_client
+            .execute(
+                query,
+                &[
+                    &(stats.total_connections as i64),
+                    &(stats.succeeded_connections as i64),
+                    &(stats.failed_connections as i64),
+                    &(stats.total_bytes_in as i64),
+                    &(stats.total_bytes_out as i64),
+                ],
+            )
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
         Ok(())
     }
 }
