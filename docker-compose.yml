@@ -8,7 +8,8 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_DB: purroute
-      POSTGRES_USER: purroute_user
-      POSTGRES_PASSWORD: purroute_password
-    volumes:
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      POSTGRES_USER: purroute
+      POSTGRES_HOST_AUTH_METHOD: trust
+#      POSTGRES_PASSWORD: purroute
+#    volumes:
+#      - ./init.sql:/docker-entrypoint-initdb.d/init.sql

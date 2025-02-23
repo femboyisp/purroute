@@ -1,6 +1,5 @@
 // src/mod.rs
 use serde::Deserialize;
-use std::sync::atomic::AtomicU64;
 use thiserror::Error;
 
 pub mod config;

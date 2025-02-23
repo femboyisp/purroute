@@ -1,16 +1,26 @@
 [router]
 listen = "127.0.0.1:1337"                        # Address and port for the router to listen on. Can be an array of addresses:ports or a single address:port (ie: ["[::]:1337", "10.13.37.1:1337"]
-log = true                                       # D
+log = true
 verbose = true
 debug = true
+auth = true
+
+[database]
+host = "localhost"
+port = 5432
+user = "purroute"
+#password = "purroute"
+dbname = "purroute"
+tls = false
 
 # Individual proxy configurations (External Connections)
-[[proxy]]                                       # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration
-proxy_type = "Socks5"                           # Proxy types supported: Http, Https, Http|Https, Socks4, Socks4a, Socks5
+[[proxy]] # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration
+label = "Tor"                          # Proxy types supported: Http, Https, Http|Https, Socks4, Socks4a, Socks5
+proxy_type = "Socks5"
 address = "127.0.0.1:9050"                      # If port is not specified (ie: in onion/i2p addresses) we default to 80
-username = "user123"                            # (Optional) Username for proxy authentication
-password = "pass456"                            # (Optional) Password for proxy authentication
 
 [[proxy]]
 proxy_type = "Http"                             # If just Http or Https is specified then it will be strictly that protocol
 address = "proxy2.example.com:8080"             # If port is not specified (ie: in onion/i2p addresses) we default to 80
+username = "user123"                            # (Optional) Username for proxy authentication
+password = "pass456"                            # (Optional) Password for proxy authentication

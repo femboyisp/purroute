@@ -1,4 +1,3 @@
-// src/config.rs
 use crate::protocols::Proxy;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
@@ -14,9 +13,9 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct DatabaseConfig {
     pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: String,
+    pub port: i32,
+    pub user: Option<String>,
+    pub password: Option<String>,
     pub dbname: String,
     pub tls: bool,
 }

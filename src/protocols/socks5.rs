@@ -9,8 +9,8 @@
 // src/protocols/socks5.rs
 use crate::{
     config::{encode_auth, ProxyConfig},
+    protocols::{Proxy, ProxyError},
     stats::{get_global_stats, GlobalStats},
-    Proxy, ProxyError,
 };
 use std::sync::Arc;
 use tokio::{
@@ -42,15 +42,15 @@ impl Socks5 {
         let stats = get_global_stats();
 
         // Track initial handshake bytes
-        stats.add_bytes_in(request.len() as u64);
-        stats.add_bytes_out(2); // Track response bytes [0x05, 0x00]
+        stats.add_bytes_in(request.len().try_into().unwrap());
+        stats.add_bytes_out(2u64); // Track response bytes [0x05, 0x00]
 
         client.write_all(&[0x05, 0x00]).await?;
 
         let mut buf = Vec::new();
         let mut header = [0u8; 4];
         client.read_exact(&mut header).await?;
-        stats.add_bytes_in(4); // Track header bytes
+        stats.add_bytes_in(4u64); // Track header bytes
         buf.extend_from_slice(&header);
 
         if header[0] != 0x05 {
@@ -63,7 +63,7 @@ impl Socks5 {
             0x01 => {
                 let mut addr = [0u8; 6];
                 client.read_exact(&mut addr).await?;
-                stats.add_bytes_in(6); // Track IPv4 address bytes
+                stats.add_bytes_in(6u64); // Track IPv4 address bytes
                 buf.extend_from_slice(&addr);
 
                 let ip = format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
@@ -73,13 +73,13 @@ impl Socks5 {
             0x03 => {
                 let mut len = [0u8; 1];
                 client.read_exact(&mut len).await?;
-                stats.add_bytes_in(1); // Track domain length byte
+                stats.add_bytes_in(1u64); // Track domain length byte
                 buf.extend_from_slice(&len);
 
                 let domain_len = len[0] as usize;
                 let mut domain = vec![0u8; domain_len + 2];
                 client.read_exact(&mut domain).await?;
-                stats.add_bytes_in(domain_len as u64 + 2); // Track domain bytes
+                stats.add_bytes_in((domain_len as u64) + 2u64); // Track domain bytes
                 buf.extend_from_slice(&domain);
 
                 let hostname = String::from_utf8_lossy(&domain[..domain_len]).to_string();
@@ -89,7 +89,7 @@ impl Socks5 {
             0x04 => {
                 let mut addr = [0u8; 18];
                 client.read_exact(&mut addr).await?;
-                stats.add_bytes_in(18); // Track IPv6 address bytes
+                stats.add_bytes_in(18u64); // Track IPv6 address bytes
                 buf.extend_from_slice(&addr);
 
                 let ip = format!(
@@ -132,11 +132,11 @@ impl Socks5 {
 
                 connect_request.extend_from_slice(b"\r\n");
                 upstream.write_all(&connect_request).await?;
-                stats.add_bytes_out(connect_request.len() as u64); // Track connect request bytes
+                stats.add_bytes_out(connect_request.len().try_into().unwrap()); // Track connect request bytes
 
                 let mut response = [0u8; 1024];
                 let n = upstream.read(&mut response).await?;
-                stats.add_bytes_in(n as u64); // Track response bytes
+                stats.add_bytes_in(n.try_into().unwrap()); // Track response bytes
                 let response_str = String::from_utf8_lossy(&response[..n]);
 
                 if !response_str.contains("200 Connection Established") {
@@ -145,55 +145,55 @@ impl Socks5 {
 
                 let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
                 client.write_all(&response).await?;
-                stats.add_bytes_out(response.len() as u64); // Track response bytes
+                stats.add_bytes_out(response.len().try_into().unwrap()); // Track response bytes
             }
             Proxy::Socks5 => {
                 upstream.write_all(&[0x05, 0x01, 0x00]).await?;
-                stats.add_bytes_out(3); // Track handshake bytes
+                stats.add_bytes_out(3u64); // Track handshake bytes
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
-                stats.add_bytes_in(2); // Track response bytes
+                stats.add_bytes_in(2u64); // Track response bytes
 
                 if response[0] != 0x05 || response[1] != 0x00 {
                     return Err(ProxyError::Protocol("Upstream handshake failed".into()));
                 }
 
                 upstream.write_all(&buf).await?;
-                stats.add_bytes_out(buf.len() as u64); // Track request bytes
+                stats.add_bytes_out(buf.len().try_into().unwrap()); // Track request bytes
 
                 let mut response = [0u8; 4];
                 upstream.read_exact(&mut response).await?;
-                stats.add_bytes_in(4); // Track response bytes
+                stats.add_bytes_in(4u64); // Track response bytes
                 client.write_all(&response).await?;
-                stats.add_bytes_out(4); // Track response bytes
+                stats.add_bytes_out(4u64); // Track response bytes
 
                 let addr_type = response[3];
                 match addr_type {
                     0x01 => {
                         let mut addr = [0u8; 6];
                         upstream.read_exact(&mut addr).await?;
-                        stats.add_bytes_in(6); // Track IPv4 address bytes
+                        stats.add_bytes_in(6u64); // Track IPv4 address bytes
                         client.write_all(&addr).await?;
-                        stats.add_bytes_out(6); // Track IPv4 address bytes
+                        stats.add_bytes_out(6u64); // Track IPv4 address bytes
                     }
                     0x03 => {
                         let mut len = [0u8; 1];
                         upstream.read_exact(&mut len).await?;
-                        stats.add_bytes_in(1); // Track domain length byte
+                        stats.add_bytes_in(1u64); // Track domain length byte
                         client.write_all(&len).await?;
-                        stats.add_bytes_out(1); // Track domain length byte
+                        stats.add_bytes_out(1u64); // Track domain length byte
                         let mut domain = vec![0u8; len[0] as usize + 2];
                         upstream.read_exact(&mut domain).await?;
-                        stats.add_bytes_in(domain.len() as u64); // Track domain bytes
+                        stats.add_bytes_in(domain.len().try_into().unwrap()); // Track domain bytes
                         client.write_all(&domain).await?;
-                        stats.add_bytes_out(domain.len() as u64); // Track domain bytes
+                        stats.add_bytes_out(domain.len().try_into().unwrap()); // Track domain bytes
                     }
                     0x04 => {
                         let mut addr = [0u8; 18];
                         upstream.read_exact(&mut addr).await?;
-                        stats.add_bytes_in(18); // Track IPv6 address bytes
+                        stats.add_bytes_in(18u64); // Track IPv6 address bytes
                         client.write_all(&addr).await?;
-                        stats.add_bytes_out(18); // Track IPv6 address bytes
+                        stats.add_bytes_out(18u64); // Track IPv6 address bytes
                     }
                     _ => {
                         return Err(ProxyError::Protocol(

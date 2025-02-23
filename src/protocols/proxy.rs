@@ -18,6 +18,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tokio_postgres::Client;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub enum Proxy {
@@ -43,20 +44,21 @@ pub enum ProxyError {
 #[derive(Clone)]
 pub struct ProxyServer {
     proxy: Arc<Vec<ProxyConfig>>,
-    logger: Arc<StatsDisplay>,
     config: Arc<RouterConfig>,
+    db_client: Arc<Client>,
 }
 
 impl ProxyServer {
     pub fn new(
         proxy: Vec<ProxyConfig>,
-        logger: Arc<StatsDisplay>,
+        _logger: Arc<StatsDisplay>,
         config: Arc<RouterConfig>,
+        db_client: Arc<Client>,
     ) -> Self {
         Self {
             proxy: Arc::new(proxy),
-            logger,
             config,
+            db_client,
         }
     }
 
@@ -96,11 +98,9 @@ impl ProxyServer {
         label: Option<String>,
     ) -> Result<(), ProxyError> {
         let global_stats = get_global_stats();
-        // Clone the data we need to move into the spawned task
         let proxy = self.proxy.clone();
         let server = self.clone();
 
-        // Use tokio::spawn to ensure cleanup happens even if the task is cancelled
         let handle = tokio::spawn(async move {
             let result = async {
                 let mut buf = vec![0u8; 8192];
@@ -265,19 +265,18 @@ impl ProxyServer {
                 let password = parts.next().ok_or(ProxyError::AuthFailed)?;
 
                 let query = "
-                    SELECT account
-                    FROM public.accounts
-                    WHERE username = $1 AND password = $2
-                ";
+                       SELECT account
+                       FROM public.accounts
+                       WHERE username = $1 AND password = $2
+                   ";
 
-                if let Some(db_client) = &self.config.db_client {
-                    if let Some(row) = db_client
-                        .query_opt(query, &[&username, &password])
-                        .await
-                        .map_err(|_| ProxyError::AuthFailed)?
-                    {
-                        return Ok(Some(row.get(0)));
-                    }
+                if let Some(row) = self
+                    .db_client
+                    .query_opt(query, &[&username, &password])
+                    .await
+                    .map_err(|_| ProxyError::AuthFailed)?
+                {
+                    return Ok(Some(row.get(0)));
                 }
 
                 return Err(ProxyError::AuthFailed);
@@ -293,7 +292,7 @@ impl ProxyServer {
         mut upstream: TcpStream,
         peer_addr: SocketAddr,
         stats: Arc<GlobalStats>,
-        user_account: Option<i64>,
+        id: Option<i64>,
     ) -> Result<(), ProxyError> {
         let (mut client_reader, mut client_writer) = client.split();
         let (mut upstream_reader, mut upstream_writer) = upstream.split();
@@ -308,9 +307,9 @@ impl ProxyServer {
                 match client_reader.read(&mut buf).await {
                     Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
-                        stats.add_bytes_out(n as u64);
-                        if let Some(account) = user_account {
-                            self.add_user_bytes_out(account, n as u64).await?;
+                        stats.add_bytes_out(n.try_into().unwrap());
+                        if let Some(id) = id {
+                            self.add_user_bytes_out(id, n.try_into().unwrap()).await?;
                         }
                         if let Err(e) = upstream_writer.write_all(&buf[..n]).await {
                             stats.record_connection_result(
@@ -349,9 +348,9 @@ impl ProxyServer {
                 match upstream_reader.read(&mut buf).await {
                     Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
-                        stats.add_bytes_in(n as u64);
-                        if let Some(account) = user_account {
-                            self.add_user_bytes_in(account, n as u64).await?;
+                        stats.add_bytes_in(n.try_into().unwrap());
+                        if let Some(id) = id {
+                            self.add_user_bytes_in(id, n.try_into().unwrap()).await?;
                         }
                         if let Err(e) = client_writer.write_all(&buf[..n]).await {
                             stats.record_connection_result(
@@ -399,50 +398,42 @@ impl ProxyServer {
         result
     }
 
-    async fn add_user_bytes_in(&self, account: i64, bytes: u64) -> Result<(), ProxyError> {
+    async fn add_user_bytes_in(&self, id: i64, bytes: i64) -> Result<(), ProxyError> {
         let query = "
                 UPDATE public.user_stats
                 SET total_bytes_in = total_bytes_in + $1
-                WHERE account = $2
+                WHERE id = $2
             ";
 
-        if let Some(db_client) = &self.config.db_client {
-            db_client
-                .execute(query, &[&(bytes as i64), &account])
-                .await
-                .map_err(|e| {
-                    ProxyError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-        } else {
-            return Err(ProxyError::AuthFailed);
-        }
+        self.db_client
+            .execute(query, &[&bytes, &id])
+            .await
+            .map_err(|e| {
+                ProxyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
 
         Ok(())
     }
 
-    async fn add_user_bytes_out(&self, account: i64, bytes: u64) -> Result<(), ProxyError> {
+    async fn add_user_bytes_out(&self, id: i64, bytes: i64) -> Result<(), ProxyError> {
         let query = "
                         UPDATE public.user_stats
                         SET total_bytes_out = total_bytes_out + $1
-                        WHERE account = $2
+                        WHERE id = $2
                     ";
 
-        if let Some(db_client) = &self.config.db_client {
-            db_client
-                .execute(query, &[&(bytes as i64), &account])
-                .await
-                .map_err(|e| {
-                    ProxyError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-        } else {
-            return Err(ProxyError::AuthFailed);
-        }
+        self.db_client
+            .execute(query, &[&bytes, &id])
+            .await
+            .map_err(|e| {
+                ProxyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
 
         Ok(())
     }

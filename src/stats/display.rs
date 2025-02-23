@@ -1,4 +1,3 @@
-// src/stats/display.rs
 use chrono::DateTime;
 use crossterm::{
     cursor,
@@ -26,7 +25,7 @@ const MAX_LOG_LINES: usize = 10;
 
 #[derive(Clone)]
 pub struct LogEntry {
-    timestamp: u64,
+    timestamp: i64,
     message: String,
     level: LogLevel,
 }
@@ -57,7 +56,7 @@ impl StatsDisplay {
         }
     }
 
-    fn format_bytes(bytes: u64, is_rate: bool) -> String {
+    fn format_bytes(bytes: i64, is_rate: bool) -> String {
         const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
         let mut bytes = bytes as f64;
         let mut unit_index = 0;
@@ -257,7 +256,7 @@ impl StatsDisplay {
                         timestamp: SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
-                            .as_secs(),
+                            .as_secs() as i64,
                         message,
                         level,
                     });
@@ -283,19 +282,18 @@ impl StatsDisplay {
                 failed_connections = $3,
                 total_bytes_in = $4,
                 total_bytes_out = $5
-            WHERE id = 1
         ";
+
+        let total_conn = stats.total_connections;
+        let succ_conn = stats.succeeded_connections;
+        let fail_conn = stats.failed_connections;
+        let bytes_in = stats.total_bytes_in;
+        let bytes_out = stats.total_bytes_out;
 
         self.db_client
             .execute(
                 query,
-                &[
-                    &(stats.total_connections as i64),
-                    &(stats.succeeded_connections as i64),
-                    &(stats.failed_connections as i64),
-                    &(stats.total_bytes_in as i64),
-                    &(stats.total_bytes_out as i64),
-                ],
+                &[&total_conn, &succ_conn, &fail_conn, &bytes_in, &bytes_out],
             )
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;

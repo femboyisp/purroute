@@ -2,7 +2,7 @@
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -13,38 +13,38 @@ use crate::stats::display::LogLevel;
 
 #[derive(Debug)]
 pub struct GlobalStats {
-    pub current_bytes_in: AtomicU64,
-    pub current_bytes_out: AtomicU64,
-    pub total_bytes_in: AtomicU64,
-    pub total_bytes_out: AtomicU64,
-    pub active_connections: AtomicU64,
-    pub total_connections: AtomicU64,
-    pub failed_connections: AtomicU64,
-    pub succeeded_connections: AtomicU64,
-    pub user_stats: Mutex<HashMap<String, UserStats>>,
+    pub current_bytes_in: AtomicI64,
+    pub current_bytes_out: AtomicI64,
+    pub total_bytes_in: AtomicI64,
+    pub total_bytes_out: AtomicI64,
+    pub active_connections: AtomicI64,
+    pub total_connections: AtomicI64,
+    pub failed_connections: AtomicI64,
+    pub succeeded_connections: AtomicI64,
+    pub user_stats: Mutex<HashMap<u64, UserStats>>, // Changed to use user IDs
     last_activity: Mutex<Instant>,
     log_tx: broadcast::Sender<(String, LogLevel)>,
 }
 
 #[derive(Debug)]
 pub struct UserStats {
-    pub bytes_in: AtomicU64,
-    pub bytes_out: AtomicU64,
-    pub connections: AtomicU64,
+    pub bytes_in: AtomicI64,
+    pub bytes_out: AtomicI64,
+    pub connections: AtomicI64,
 }
 
 impl GlobalStats {
     pub fn new() -> Self {
         let (log_tx, _) = broadcast::channel(100);
         Self {
-            current_bytes_in: AtomicU64::new(0),
-            current_bytes_out: AtomicU64::new(0),
-            total_bytes_in: AtomicU64::new(0),
-            total_bytes_out: AtomicU64::new(0),
-            active_connections: AtomicU64::new(0),
-            total_connections: AtomicU64::new(0),
-            failed_connections: AtomicU64::new(0),
-            succeeded_connections: AtomicU64::new(0),
+            current_bytes_in: AtomicI64::new(0),
+            current_bytes_out: AtomicI64::new(0),
+            total_bytes_in: AtomicI64::new(0),
+            total_bytes_out: AtomicI64::new(0),
+            active_connections: AtomicI64::new(0),
+            total_connections: AtomicI64::new(0),
+            failed_connections: AtomicI64::new(0),
+            succeeded_connections: AtomicI64::new(0),
             user_stats: Mutex::new(HashMap::new()),
             last_activity: Mutex::new(Instant::now()),
             log_tx,
@@ -66,15 +66,15 @@ impl GlobalStats {
                 match level {
                     LogLevel::Info => {
                         if config.verbose.unwrap_or(false) || config.debug.unwrap_or(false) {
-                            self.log_tx.send((message.clone(), level)).unwrap_or(0);
+                            let _ = self.log_tx.send((message.clone(), level));
                         }
                     }
                     LogLevel::Error => {
-                        self.log_tx.send((message.clone(), level)).unwrap_or(0);
+                        let _ = self.log_tx.send((message.clone(), level));
                     }
                     LogLevel::Success => {
                         if config.verbose.unwrap_or(false) {
-                            self.log_tx.send((message.clone(), level)).unwrap_or(0);
+                            let _ = self.log_tx.send((message.clone(), level));
                         }
                     }
                 }
@@ -102,50 +102,18 @@ impl GlobalStats {
 
     pub fn add_bytes_in(&self, bytes: u64) {
         *self.last_activity.lock() = Instant::now();
-        self.current_bytes_in.fetch_add(bytes, Ordering::Release);
-        self.total_bytes_in.fetch_add(bytes, Ordering::Release);
+        self.current_bytes_in
+            .fetch_add(bytes.try_into().unwrap(), Ordering::Release);
+        self.total_bytes_in
+            .fetch_add(bytes.try_into().unwrap(), Ordering::Release);
     }
 
     pub fn add_bytes_out(&self, bytes: u64) {
         *self.last_activity.lock() = Instant::now();
-        self.current_bytes_out.fetch_add(bytes, Ordering::Release);
-        self.total_bytes_out.fetch_add(bytes, Ordering::Release);
-    }
-
-    pub fn add_user_bytes_in(&self, user: &str, bytes: u64) {
-        let mut user_stats = self.user_stats.lock();
-        let stats = user_stats
-            .entry(user.to_string())
-            .or_insert_with(|| UserStats {
-                bytes_in: AtomicU64::new(0),
-                bytes_out: AtomicU64::new(0),
-                connections: AtomicU64::new(0),
-            });
-        stats.bytes_in.fetch_add(bytes, Ordering::Release);
-    }
-
-    pub fn add_user_bytes_out(&self, user: &str, bytes: u64) {
-        let mut user_stats = self.user_stats.lock();
-        let stats = user_stats
-            .entry(user.to_string())
-            .or_insert_with(|| UserStats {
-                bytes_in: AtomicU64::new(0),
-                bytes_out: AtomicU64::new(0),
-                connections: AtomicU64::new(0),
-            });
-        stats.bytes_out.fetch_add(bytes, Ordering::Release);
-    }
-
-    pub fn increment_user_connections(&self, user: &str) {
-        let mut user_stats = self.user_stats.lock();
-        let stats = user_stats
-            .entry(user.to_string())
-            .or_insert_with(|| UserStats {
-                bytes_in: AtomicU64::new(0),
-                bytes_out: AtomicU64::new(0),
-                connections: AtomicU64::new(0),
-            });
-        stats.connections.fetch_add(1, Ordering::SeqCst);
+        self.current_bytes_out
+            .fetch_add(bytes.try_into().unwrap(), Ordering::Release);
+        self.total_bytes_out
+            .fetch_add(bytes.try_into().unwrap(), Ordering::Release);
     }
 
     pub fn get_stats(&self) -> GlobalStatsSnapshot {
@@ -180,22 +148,55 @@ impl GlobalStats {
 
     pub async fn load_from_db(&self, db_client: &Client) -> Result<(), Box<dyn std::error::Error>> {
         let query = "
-                SELECT total_connections, succeeded_connections, failed_connections, total_bytes_in, total_bytes_out
-                FROM public.global
-                WHERE id = 1
-            ";
+                    SELECT total_connections, succeeded_connections, failed_connections, total_bytes_in, total_bytes_out
+                    FROM public.global
+                ";
 
         if let Some(row) = db_client.query_opt(query, &[]).await? {
             self.total_connections
-                .store(row.get::<_, i64>(0) as u64, Ordering::SeqCst);
+                .store(row.get::<_, i64>(0), Ordering::SeqCst);
             self.succeeded_connections
-                .store(row.get::<_, i64>(1) as u64, Ordering::SeqCst);
+                .store(row.get::<_, i64>(1), Ordering::SeqCst);
             self.failed_connections
-                .store(row.get::<_, i64>(2) as u64, Ordering::SeqCst);
+                .store(row.get::<_, i64>(2), Ordering::SeqCst);
             self.total_bytes_in
-                .store(row.get::<_, i64>(3) as u64, Ordering::SeqCst);
+                .store(row.get::<_, i64>(3), Ordering::SeqCst);
             self.total_bytes_out
-                .store(row.get::<_, i64>(4) as u64, Ordering::SeqCst);
+                .store(row.get::<_, i64>(4), Ordering::SeqCst);
+        }
+
+        // Load user stats from the database
+        let user_query = "
+                    SELECT id, total_bytes_in, total_bytes_out, total_connections
+                    FROM public.user_stats
+                ";
+        for row in db_client.query(user_query, &[]).await? {
+            let id: i64 = row.get(0); // Changed i32 to i64
+            let bytes_in: i64 = row.get(1); // Changed i32 to i64
+            let bytes_out: i64 = row.get(2); // Changed i32 to i64
+            let connections: i64 = row.get(3); // Changed i32 to i64
+
+            let mut user_stats = self.user_stats.lock();
+            let id_u64 = id.try_into().unwrap();
+            user_stats
+                .entry(id_u64)
+                .or_insert_with(|| UserStats {
+                    bytes_in: AtomicI64::new(0),
+                    bytes_out: AtomicI64::new(0),
+                    connections: AtomicI64::new(0),
+                })
+                .bytes_in
+                .store(bytes_in, Ordering::SeqCst);
+            user_stats
+                .get_mut(&id_u64)
+                .unwrap()
+                .bytes_out
+                .store(bytes_out, Ordering::SeqCst);
+            user_stats
+                .get_mut(&id_u64)
+                .unwrap()
+                .connections
+                .store(connections, Ordering::SeqCst);
         }
 
         Ok(())
@@ -204,14 +205,14 @@ impl GlobalStats {
 
 #[derive(Debug, Clone)]
 pub struct GlobalStatsSnapshot {
-    pub current_bytes_in: u64,
-    pub current_bytes_out: u64,
-    pub total_bytes_in: u64,
-    pub total_bytes_out: u64,
-    pub active_connections: u64,
-    pub total_connections: u64,
-    pub failed_connections: u64,
-    pub succeeded_connections: u64,
+    pub current_bytes_in: i64,
+    pub current_bytes_out: i64,
+    pub total_bytes_in: i64,
+    pub total_bytes_out: i64,
+    pub active_connections: i64,
+    pub total_connections: i64,
+    pub failed_connections: i64,
+    pub succeeded_connections: i64,
 }
 
 pub static GLOBAL_STATS: Lazy<Arc<GlobalStats>> = Lazy::new(|| Arc::new(GlobalStats::new()));

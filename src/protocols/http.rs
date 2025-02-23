@@ -3,8 +3,8 @@
 // src/protocols/http.rs
 use crate::{
     config::{encode_auth, ProxyConfig},
+    protocols::{Proxy, ProxyError},
     stats::{get_global_stats, GlobalStats},
-    Proxy, ProxyError,
 };
 use std::sync::Arc;
 use tokio::{
