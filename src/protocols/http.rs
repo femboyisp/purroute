@@ -83,8 +83,28 @@ impl Http {
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
 
-                if response[0] != 0x05 || response[1] != 0x00 {
-                    return Err(ProxyError::Protocol("Upstream handshake failed".into()));
+                // Handle user authentication
+                if let (Some(username), Some(password)) =
+                    (&target_proxy.username, &target_proxy.password)
+                {
+                    // Send username/password authentication request
+                    let mut auth_request = Vec::new();
+                    auth_request.push(0x01); // Username/Password authentication version
+                    auth_request.push(username.len() as u8); // Username length
+                    auth_request.extend_from_slice(username.as_bytes()); // Username
+                    auth_request.push(password.len() as u8); // Password length
+                    auth_request.extend_from_slice(password.as_bytes()); // Password
+
+                    upstream.write_all(&auth_request).await?;
+                    stats.add_bytes_out(auth_request.len() as u64); // Track auth request bytes
+
+                    let mut auth_response = [0u8; 2];
+                    upstream.read_exact(&mut auth_response).await?;
+                    stats.add_bytes_in(2); // Track auth response bytes
+
+                    if auth_response[1] != 0x00 {
+                        return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                    }
                 }
 
                 // Create SOCKS5 connect request
