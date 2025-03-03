@@ -112,7 +112,10 @@ impl Socks5 {
 
         match target_proxy.proxy_type {
             Proxy::Http | Proxy::Https => {
+                // Convert SOCKS5 to HTTP CONNECT
                 let mut connect_request = Vec::new();
+
+                // Construct CONNECT request
                 connect_request.extend_from_slice(
                     format!("CONNECT {}:{} HTTP/1.1\r\n", target_host, target_port).as_bytes(),
                 );
@@ -120,6 +123,7 @@ impl Socks5 {
                     format!("Host: {}:{}\r\n", target_host, target_port).as_bytes(),
                 );
 
+                // Add authentication if provided
                 if let (Some(username), Some(password)) =
                     (&target_proxy.username, &target_proxy.password)
                 {
@@ -130,9 +134,12 @@ impl Socks5 {
                 }
 
                 connect_request.extend_from_slice(b"\r\n");
+
+                // Send CONNECT request
                 upstream.write_all(&connect_request).await?;
                 stats.add_bytes_out(connect_request.len() as u64); // Track connect request bytes
 
+                // Read HTTP response
                 let mut response = [0u8; 1024];
                 let n = upstream.read(&mut response).await?;
                 stats.add_bytes_in(n as u64); // Track response bytes
@@ -142,19 +149,48 @@ impl Socks5 {
                     return Err(ProxyError::Protocol("HTTP tunnel failed".into()));
                 }
 
-                let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                // Send success response to SOCKS5 client
+                let response = [
+                    0x05, // SOCKS version
+                    0x00, // Success
+                    0x00, // Reserved
+                    0x01, // IPv4
+                    0x00, 0x00, 0x00, 0x00, // IP (4 bytes)
+                    0x00, 0x00, // Port (2 bytes)
+                ];
                 client.write_all(&response).await?;
                 stats.add_bytes_out(response.len() as u64); // Track response bytes
             }
             Proxy::Socks5 => {
+                // SOCKS5 handshake with upstream
                 upstream.write_all(&[0x05, 0x01, 0x00]).await?;
                 stats.add_bytes_out(3); // Track handshake bytes
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
                 stats.add_bytes_in(2); // Track response bytes
 
-                if response[0] != 0x05 || response[1] != 0x00 {
-                    return Err(ProxyError::Protocol("Upstream handshake failed".into()));
+                // handle user authentication
+                if let (Some(username), Some(password)) =
+                    (&target_proxy.username, &target_proxy.password)
+                {
+                    // Send username/password authentication request
+                    let mut auth_request = Vec::new();
+                    auth_request.push(0x01); // Username/Password authentication version
+                    auth_request.push(username.len() as u8); // Username length
+                    auth_request.extend_from_slice(username.as_bytes()); // Username
+                    auth_request.push(password.len() as u8); // Password length
+                    auth_request.extend_from_slice(password.as_bytes()); // Password
+
+                    upstream.write_all(&auth_request).await?;
+                    stats.add_bytes_out(auth_request.len() as u64); // Track auth request bytes
+
+                    let mut auth_response = [0u8; 2];
+                    upstream.read_exact(&mut auth_response).await?;
+                    stats.add_bytes_in(2); // Track auth response bytes
+
+                    if auth_response[1] != 0x00 {
+                        return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                    }
                 }
 
                 upstream.write_all(&buf).await?;
