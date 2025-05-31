@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  # SOCKS5 proxy server with auth
+  socks5_auth:
+    image: serjs/go-socks5-proxy
+    ports:
+      - "1080:1080"
+    environment:
+      - PROXY_USER=testuser
+      - PROXY_PASSWORD=testpass
+    command: ["-l", "0.0.0.0:1080", "--allow-ip", "0.0.0.0/0"]
+    networks:
+      - test_network
+    dns:
+      - 127.0.0.11  # Docker's internal DNS
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:1080"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # SOCKS5 proxy server without auth
+  socks5_noauth:
+    image: serjs/go-socks5-proxy
+    ports:
+      - "1082:1080"
+    command: ["-l", "0.0.0.0:1080", "--allow-ip", "0.0.0.0/0"]
+    networks:
+      - test_network
+    dns:
+      - 127.0.0.11  # Docker's internal DNS
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:1080"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # SOCKS4 proxy server with auth
+  socks4_auth:
+    image: haproxy:2.4
+    ports:
+      - "1081:1080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - test_network
+    dns:
+      - 127.0.0.11  # Docker's internal DNS
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:1080"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # SOCKS4 proxy server without auth
+  socks4_noauth:
+    image: haproxy:2.4
+    ports:
+      - "1083:1080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - test_network
+    dns:
+      - 127.0.0.11  # Docker's internal DNS
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:1080"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # HTTP/HTTPS proxy server with auth (Squid)
+  http_auth:
+    image: ubuntu/squid:latest
+    ports:
+      - "8888:3128"
+    environment:
+      - SQUID_USERNAME=testuser
+      - SQUID_PASSWORD=testpass
+    networks:
+      - test_network
+    dns:
+      - 127.0.0.11  # Docker's internal DNS
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3128"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # HTTP/HTTPS proxy server without auth (Squid)
+  http_noauth:
+    image: ubuntu/squid:latest
+    ports:
+      - "8889:3128"
+    networks:
+      - test_network
+    dns:
+      - 127.0.0.11  # Docker's internal DNS
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3128"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Test target server (simple HTTP server)
+  target:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./target:/usr/share/nginx/html
+    networks:
+      - test_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:80"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+networks:
+  test_network:
+    driver: bridge 
