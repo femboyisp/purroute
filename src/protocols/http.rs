@@ -34,6 +34,7 @@ impl Http {
             .next()
             .ok_or_else(|| ProxyError::Protocol("Invalid HTTP request".to_string()))?;
 
+        let mut client = client;
         let mut upstream = TcpStream::connect(upstream_addr).await?;
         let stats = get_global_stats();
 
@@ -66,6 +67,48 @@ impl Http {
                 // Track modified request bytes
                 stats.add_bytes_out(modified_request.len() as u64);
                 upstream.write_all(&modified_request).await?;
+            }
+            Proxy::Socks4 => {
+                // Extract host and port from Host header
+                let host_header = request_str
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("host: "))
+                    .ok_or_else(|| ProxyError::Protocol("No Host header found".to_string()))?;
+                let host_value = &host_header[6..];
+                let mut parts = host_value.trim().split(':');
+                let host = parts.next().unwrap_or("");
+                let port = parts.next().unwrap_or("80").parse::<u16>().unwrap_or(80);
+
+                // Create SOCKS4 request
+                let mut socks_request = vec![0x04, 0x01]; // SOCKS4, CONNECT command
+                socks_request.extend_from_slice(&port.to_be_bytes());
+                socks_request.extend_from_slice(&[0, 0, 0, 1]); // IP (0.0.0.1 for SOCKS4a)
+                socks_request.push(0); // Empty user ID
+                socks_request.extend_from_slice(host.as_bytes()); // Domain name
+                socks_request.push(0); // Null terminator
+
+                // Send SOCKS4 request
+                upstream.write_all(&socks_request).await?;
+                stats.add_bytes_out(socks_request.len() as u64);
+
+                // Read response
+                let mut response = [0u8; 8];
+                upstream.read_exact(&mut response).await?;
+                stats.add_bytes_in(8);
+
+                if response[1] != 0x5A {
+                    return Err(ProxyError::Protocol("SOCKS4 connection failed".into()));
+                }
+
+                // For HTTPS, send 200 Connection Established
+                if first_line.contains("CONNECT") {
+                    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+                    stats.add_bytes_out(47);
+                } else {
+                    // For HTTP, forward the original request
+                    upstream.write_all(&request).await?;
+                    stats.add_bytes_out(request.len() as u64);
+                }
             }
             Proxy::Socks5 => {
                 // Extract host and port from Host header

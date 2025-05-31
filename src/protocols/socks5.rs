@@ -162,6 +162,39 @@ impl Socks5 {
                 client.write_all(&response).await?;
                 stats.add_bytes_out(response.len().try_into().unwrap()); // Track response bytes
             }
+            Proxy::Socks4 => {
+                // Convert SOCKS5 to SOCKS4 request
+                let mut socks4_request = vec![0x04, 0x01]; // SOCKS4, CONNECT command
+                socks4_request.extend_from_slice(&target_port.to_be_bytes());
+                socks4_request.extend_from_slice(&[0, 0, 0, 1]); // IP (0.0.0.1 for SOCKS4a)
+                socks4_request.push(0); // Empty user ID
+                socks4_request.extend_from_slice(target_host.as_bytes()); // Domain name
+                socks4_request.push(0); // Null terminator
+
+                upstream.write_all(&socks4_request).await?;
+                stats.add_bytes_out(socks4_request.len().try_into().unwrap());
+
+                // Read SOCKS4 response
+                let mut response = [0u8; 8];
+                upstream.read_exact(&mut response).await?;
+                stats.add_bytes_in(8);
+
+                if response[1] != 0x5A {
+                    return Err(ProxyError::Protocol("SOCKS4 connection failed".into()));
+                }
+
+                // Send SOCKS5 success response
+                let response = [
+                    0x05, // SOCKS version
+                    0x00, // Success
+                    0x00, // Reserved
+                    0x01, // IPv4
+                    0x00, 0x00, 0x00, 0x00, // IP (4 bytes)
+                    0x00, 0x00, // Port (2 bytes)
+                ];
+                client.write_all(&response).await?;
+                stats.add_bytes_out(response.len().try_into().unwrap());
+            }
             Proxy::Socks5 => {
                 // SOCKS5 handshake with upstream
                 upstream.write_all(&[0x05, 0x01, 0x00]).await?;

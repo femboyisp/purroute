@@ -8,7 +8,7 @@
 use tokio::time::Duration;
 use tokio_postgres::{Client, Config, Error, NoTls};
 
-use rand::{distributions::Alphanumeric, Rng};
+use rand::Rng;
 use std::sync::Arc;
 
 mod config;
@@ -22,10 +22,15 @@ use crate::{
 };
 
 fn generate_random_string(length: usize) -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(length)
-        .map(char::from)
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                            abcdefghijklmnopqrstuvwxyz\
+                            0123456789";
+    let mut rng = rand::rng();
+    (0..length)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
         .collect()
 }
 async fn initialize_database(client: &Client, router_config: &RouterConfig) -> Result<(), Error> {
@@ -179,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create stats display for the server
     let stats_display = Arc::new(StatsDisplay::new(
         Arc::clone(&global_stats),
-        Duration::from_millis(1),
+        Duration::from_millis(500),
         Arc::clone(&db_client),
     ));
 
@@ -198,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create a new display instance for the display task
         let display = StatsDisplay::new(
             Arc::clone(&global_stats),
-            Duration::from_millis(1),
+            Duration::from_millis(500),
             Arc::clone(&db_client),
         );
         async move {

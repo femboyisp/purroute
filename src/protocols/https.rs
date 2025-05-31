@@ -74,6 +74,43 @@ impl Https {
                 stats.add_bytes_in(n as u64);
                 client.write_all(&response[..n]).await?;
             }
+            Proxy::Socks4 => {
+                let parts: Vec<&str> = first_line.split_whitespace().collect();
+                let target = parts
+                    .get(1)
+                    .ok_or_else(|| ProxyError::Protocol("Invalid CONNECT request".to_string()))?;
+                let mut target_parts = target.split(':');
+                let host = target_parts.next().unwrap_or("");
+                let port = target_parts
+                    .next()
+                    .unwrap_or("443")
+                    .parse::<u16>()
+                    .unwrap_or(443);
+
+                // Create SOCKS4 request
+                let mut socks_request = vec![0x04, 0x01]; // SOCKS4, CONNECT command
+                socks_request.extend_from_slice(&port.to_be_bytes());
+                socks_request.extend_from_slice(&[0, 0, 0, 1]); // IP (0.0.0.1 for SOCKS4a)
+                socks_request.push(0); // Empty user ID
+                socks_request.extend_from_slice(host.as_bytes()); // Domain name
+                socks_request.push(0); // Null terminator
+
+                upstream.write_all(&socks_request).await?;
+                stats.add_bytes_out(socks_request.len() as u64);
+
+                // Read response
+                let mut response = [0u8; 8];
+                upstream.read_exact(&mut response).await?;
+                stats.add_bytes_in(8);
+
+                if response[1] != 0x5A {
+                    return Err(ProxyError::Protocol("SOCKS4 connection failed".into()));
+                }
+
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+            }
             Proxy::Socks5 => {
                 let parts: Vec<&str> = first_line.split_whitespace().collect();
                 let target = parts
