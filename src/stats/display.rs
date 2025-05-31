@@ -240,6 +240,8 @@ impl StatsDisplay {
         let mut stdout = stdout();
         let mut interval = interval(self.update_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_stats = None;
+        let mut has_new_logs = false;
 
         stdout.queue(cursor::Hide)?;
 
@@ -248,6 +250,7 @@ impl StatsDisplay {
 
             // Process any new logs
             while let Ok((message, level)) = self.log_rx.try_recv() {
+                has_new_logs = true;
                 if let Ok(mut logs) = self.logs.lock() {
                     if logs.len() >= MAX_LOG_LINES {
                         logs.pop_front();
@@ -264,9 +267,24 @@ impl StatsDisplay {
             }
 
             let stats = self.stats.get_stats();
+            
+            // Only refresh if stats have changed or there are new logs
+            let stats_changed = last_stats.as_ref().map_or(true, |last: &GlobalStatsSnapshot| {
+                last.current_bytes_in != stats.current_bytes_in ||
+                last.current_bytes_out != stats.current_bytes_out ||
+                last.total_bytes_in != stats.total_bytes_in ||
+                last.total_bytes_out != stats.total_bytes_out ||
+                last.active_connections != stats.active_connections ||
+                last.total_connections != stats.total_connections ||
+                last.failed_connections != stats.failed_connections ||
+                last.succeeded_connections != stats.succeeded_connections
+            });
 
-            // Update display
-            self.refresh_display(&stats, &config)?;
+            if has_new_logs || stats_changed {
+                self.refresh_display(&stats, &config)?;
+                last_stats = Some(stats.clone());
+                has_new_logs = false;
+            }
 
             // Record statistics in the database
             self.record_stats_in_db(&stats).await?;

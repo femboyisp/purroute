@@ -7,7 +7,7 @@
 // src/protocols/proxy.rs
 use crate::{
     config::{ProxyConfig, RouterConfig},
-    protocols::{Http, Https, Socks5},
+    protocols::{Http, Https, Socks5, Socks4},
     stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
 use base64::Engine;
@@ -24,6 +24,7 @@ use tokio_postgres::Client;
 pub enum Proxy {
     Http,
     Https,
+    Socks4,
     Socks5,
 }
 
@@ -151,6 +152,29 @@ impl ProxyServer {
                         )
                         .await
                     }
+                    Proxy::Socks4 => {
+                        Socks4::handle(
+                            client,
+                            &target_proxy.address,
+                            initial_request,
+                            target_proxy,
+                            move |client, upstream, stats| {
+                                let server = server.clone();
+                                let peer = peer_addr;
+                                Box::pin(async move {
+                                    stats.record_connection_result(
+                                        true,
+                                        format!("Socks4 Connection successful for {}", peer_addr),
+                                        &server.config,
+                                    );
+                                    server
+                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .await
+                                })
+                            },
+                        )
+                        .await
+                    }
                     Proxy::Http => {
                         Http::handle(
                             client,
@@ -217,6 +241,10 @@ impl ProxyServer {
 
         if request[0] == 0x05 {
             return Ok(Proxy::Socks5);
+        }
+
+        if request[0] == 0x04 {
+            return Ok(Proxy::Socks4);
         }
 
         let request_str = String::from_utf8_lossy(&request[..std::cmp::min(request.len(), 20)]);
