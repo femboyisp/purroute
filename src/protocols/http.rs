@@ -121,33 +121,47 @@ impl Http {
                 let host = parts.next().unwrap_or("");
                 let port = parts.next().unwrap_or("80").parse::<u16>().unwrap_or(80);
 
-                // SOCKS5 handshake
-                upstream.write_all(&[0x05, 0x01, 0x00]).await?;
+                // SOCKS5 handshake - offer both no auth and username/password auth
+                let handshake = if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
+                    // Offer both no auth and username/password auth
+                    vec![0x05, 0x02, 0x00, 0x02]
+                } else {
+                    // Only offer no auth
+                    vec![0x05, 0x01, 0x00]
+                };
+                upstream.write_all(&handshake).await?;
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
 
-                // Handle user authentication
-                if let (Some(username), Some(password)) =
-                    (&target_proxy.username, &target_proxy.password)
-                {
-                    // Send username/password authentication request
-                    let mut auth_request = Vec::new();
-                    auth_request.push(0x01); // Username/Password authentication version
-                    auth_request.push(username.len() as u8); // Username length
-                    auth_request.extend_from_slice(username.as_bytes()); // Username
-                    auth_request.push(password.len() as u8); // Password length
-                    auth_request.extend_from_slice(password.as_bytes()); // Password
+                // Check if upstream selected username/password authentication
+                if response[1] == 0x02 {
+                    // Handle user authentication
+                    if let (Some(username), Some(password)) =
+                        (&target_proxy.username, &target_proxy.password)
+                    {
+                        // Send username/password authentication request
+                        let mut auth_request = Vec::new();
+                        auth_request.push(0x01); // Username/Password authentication version
+                        auth_request.push(username.len() as u8); // Username length
+                        auth_request.extend_from_slice(username.as_bytes()); // Username
+                        auth_request.push(password.len() as u8); // Password length
+                        auth_request.extend_from_slice(password.as_bytes()); // Password
 
-                    upstream.write_all(&auth_request).await?;
-                    stats.add_bytes_out(auth_request.len() as u64); // Track auth request bytes
+                        upstream.write_all(&auth_request).await?;
+                        stats.add_bytes_out(auth_request.len() as u64); // Track auth request bytes
 
-                    let mut auth_response = [0u8; 2];
-                    upstream.read_exact(&mut auth_response).await?;
-                    stats.add_bytes_in(2); // Track auth response bytes
+                        let mut auth_response = [0u8; 2];
+                        upstream.read_exact(&mut auth_response).await?;
+                        stats.add_bytes_in(2); // Track auth response bytes
 
-                    if auth_response[1] != 0x00 {
-                        return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                        if auth_response[1] != 0x00 {
+                            return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                        }
+                    } else {
+                        return Err(ProxyError::Protocol("Username/password required but not provided".into()));
                     }
+                } else if response[1] != 0x00 {
+                    return Err(ProxyError::Protocol("Upstream SOCKS5 handshake failed".into()));
                 }
 
                 // Create SOCKS5 connect request
@@ -186,9 +200,15 @@ impl Http {
                     _ => return Err(ProxyError::Protocol("Invalid address type".into())),
                 }
 
-                // Track bytes before sending
-                stats.add_bytes_out(request.len() as u64);
-                upstream.write_all(&request).await?;
+                // For HTTPS CONNECT, send 200 Connection Established
+                if first_line.contains("CONNECT") {
+                    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+                    stats.add_bytes_out(47);
+                } else {
+                    // For HTTP, send the original request through the SOCKS5 tunnel
+                    stats.add_bytes_out(request.len() as u64);
+                    upstream.write_all(&request).await?;
+                }
             }
         }
 

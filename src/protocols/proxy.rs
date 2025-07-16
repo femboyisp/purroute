@@ -132,7 +132,7 @@ impl ProxyServer {
                     Proxy::Socks5 => {
                         Socks5::handle(
                             client,
-                            &target_proxy.address,
+                            &target_proxy.get_upstream_addr(),
                             initial_request,
                             target_proxy,
                             move |client, upstream, stats| {
@@ -155,7 +155,7 @@ impl ProxyServer {
                     Proxy::Socks4 => {
                         Socks4::handle(
                             client,
-                            &target_proxy.address,
+                            &target_proxy.get_upstream_addr(),
                             initial_request,
                             target_proxy,
                             move |client, upstream, stats| {
@@ -178,7 +178,7 @@ impl ProxyServer {
                     Proxy::Http => {
                         Http::handle(
                             client,
-                            &target_proxy.address,
+                            &target_proxy.get_upstream_addr(),
                             initial_request,
                             target_proxy,
                             move |client, upstream, stats| {
@@ -201,7 +201,7 @@ impl ProxyServer {
                     Proxy::Https => {
                         Https::handle(
                             client,
-                            &target_proxy.address,
+                            &target_proxy.get_upstream_addr(),
                             initial_request,
                             target_proxy,
                             move |client, upstream, stats| {

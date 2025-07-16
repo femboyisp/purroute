@@ -34,6 +34,7 @@ pub struct ProxyConfig {
     pub label: Option<String>,
     pub proxy_type: Proxy,
     pub address: String,
+    pub port: Option<u16>,
     pub username: Option<String>,
     pub password: Option<String>,
 }
@@ -49,4 +50,13 @@ pub fn load_config(
 
 pub fn encode_auth(username: &str, password: &str) -> String {
     STANDARD.encode(format!("{}:{}", username, password))
+}
+
+impl ProxyConfig {
+    pub fn get_upstream_addr(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}:{}", self.address, port),
+            None => self.address.clone(),
+        }
+    }
 }
