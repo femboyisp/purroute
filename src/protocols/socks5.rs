@@ -34,19 +34,46 @@ impl Socks5 {
             Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>,
         >,
     ) -> Result<(), ProxyError> {
-        if request[0] != 0x05 {
-            return Err(ProxyError::Protocol("Invalid SOCKS5 version".into()));
-        }
-
         let mut client = client;
         let stats = get_global_stats();
 
         // Track initial handshake bytes
         stats.add_bytes_in(request.len().try_into().unwrap());
-        stats.add_bytes_out(2u64); // Track response bytes [0x05, 0x00]
-
+        
+        // Parse the initial SOCKS5 greeting
+        if request.len() < 3 {
+            return Err(ProxyError::Protocol("Invalid SOCKS5 greeting length".into()));
+        }
+        
+        let version = request[0];
+        let nmethods = request[1];
+        
+        if version != 0x05 {
+            return Err(ProxyError::Protocol("Invalid SOCKS5 version".into()));
+        }
+        
+        // Check if we have enough bytes for the methods
+        if request.len() < 2 + nmethods as usize {
+            return Err(ProxyError::Protocol("Invalid SOCKS5 greeting: insufficient methods".into()));
+        }
+        
+        // Check if client supports no authentication (0x00)
+        let methods = &request[2..2 + nmethods as usize];
+        let supports_no_auth = methods.contains(&0x00);
+        
+        if !supports_no_auth {
+            return Err(ProxyError::Protocol("Client does not support no authentication".into()));
+        }
+        
+        // SOCKS5 handshake response: version 5, no authentication required
         client.write_all(&[0x05, 0x00]).await?;
+        stats.add_bytes_out(2u64); // Track response bytes [0x05, 0x00]
+        
+        // Debug logging
+        std::eprintln!("SOCKS5 handshake completed: version={}, methods={:?}", version, methods);
+        std::eprintln!("Reading SOCKS5 request...");
 
+        // Now read the SOCKS5 request
         let mut buf = Vec::new();
         let mut header = [0u8; 4];
         client.read_exact(&mut header).await?;
@@ -59,39 +86,40 @@ impl Socks5 {
             ));
         }
 
+        // Read address and port based on ATYP
+        std::eprintln!("SOCKS5 request header: {:?}", header);
         let (target_host, target_port) = match header[3] {
             0x01 => {
+                // IPv4: 4 bytes address + 2 bytes port
                 let mut addr = [0u8; 6];
                 client.read_exact(&mut addr).await?;
-                stats.add_bytes_in(6u64); // Track IPv4 address bytes
+                stats.add_bytes_in(6u64);
                 buf.extend_from_slice(&addr);
-
                 let ip = format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
                 let port = u16::from_be_bytes([addr[4], addr[5]]);
                 (ip, port)
             }
             0x03 => {
+                // Domain: 1 byte len, N bytes domain, 2 bytes port
                 let mut len = [0u8; 1];
                 client.read_exact(&mut len).await?;
-                stats.add_bytes_in(1u64); // Track domain length byte
+                stats.add_bytes_in(1u64);
                 buf.extend_from_slice(&len);
-
                 let domain_len = len[0] as usize;
                 let mut domain = vec![0u8; domain_len + 2];
                 client.read_exact(&mut domain).await?;
-                stats.add_bytes_in((domain_len as u64) + 2u64); // Track domain bytes
+                stats.add_bytes_in((domain_len as u64) + 2u64);
                 buf.extend_from_slice(&domain);
-
                 let hostname = String::from_utf8_lossy(&domain[..domain_len]).to_string();
                 let port = u16::from_be_bytes([domain[domain_len], domain[domain_len + 1]]);
                 (hostname, port)
             }
             0x04 => {
+                // IPv6: 16 bytes address + 2 bytes port
                 let mut addr = [0u8; 18];
                 client.read_exact(&mut addr).await?;
-                stats.add_bytes_in(18u64); // Track IPv6 address bytes
+                stats.add_bytes_in(18u64);
                 buf.extend_from_slice(&addr);
-
                 let ip = format!(
                     "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
                     u16::from_be_bytes([addr[0], addr[1]]),
@@ -108,8 +136,11 @@ impl Socks5 {
             }
             _ => return Err(ProxyError::Protocol("Unsupported address type".into())),
         };
+        
+        std::eprintln!("SOCKS5 target: {}:{}", target_host, target_port);
 
         let mut upstream = TcpStream::connect(upstream_addr).await?;
+        std::eprintln!("Connected to upstream proxy: {}", upstream_addr);
 
         match target_proxy.proxy_type {
             Proxy::Http | Proxy::Https => {
@@ -196,43 +227,106 @@ impl Socks5 {
                 stats.add_bytes_out(response.len().try_into().unwrap());
             }
             Proxy::Socks5 => {
-                // SOCKS5 handshake with upstream
-                upstream.write_all(&[0x05, 0x01, 0x00]).await?;
-                stats.add_bytes_out(3u64); // Track handshake bytes
+                std::eprintln!("Starting SOCKS5 handshake with upstream...");
+                // SOCKS5 handshake with upstream - offer both no auth and username/password auth
+                let handshake = if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
+                    // Offer both no auth and username/password auth
+                    vec![0x05, 0x02, 0x00, 0x02]
+                } else {
+                    // Only offer no auth
+                    vec![0x05, 0x01, 0x00]
+                };
+                upstream.write_all(&handshake).await?;
+                stats.add_bytes_out(handshake.len().try_into().unwrap()); // Track handshake bytes
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
                 stats.add_bytes_in(2u64); // Track response bytes
+                std::eprintln!("Upstream SOCKS5 handshake response: {:?}", response);
 
-                // handle user authentication
-                if let (Some(username), Some(password)) =
-                    (&target_proxy.username, &target_proxy.password)
-                {
-                    // Send username/password authentication request
-                    let mut auth_request = Vec::new();
-                    auth_request.push(0x01); // Username/Password authentication version
-                    auth_request.push(username.len() as u8); // Username length
-                    auth_request.extend_from_slice(username.as_bytes()); // Username
-                    auth_request.push(password.len() as u8); // Password length
-                    auth_request.extend_from_slice(password.as_bytes()); // Password
+                // Check if upstream selected username/password authentication
+                if response[1] == 0x02 {
+                    std::eprintln!("Upstream selected username/password authentication");
+                    // handle user authentication
+                    if let (Some(username), Some(password)) =
+                        (&target_proxy.username, &target_proxy.password)
+                    {
+                        std::eprintln!("Sending SOCKS5 authentication...");
+                        // Send username/password authentication request
+                        let mut auth_request = Vec::new();
+                        auth_request.push(0x01); // Username/Password authentication version
+                        auth_request.push(username.len() as u8); // Username length
+                        auth_request.extend_from_slice(username.as_bytes()); // Username
+                        auth_request.push(password.len() as u8); // Password length
+                        auth_request.extend_from_slice(password.as_bytes()); // Password
 
-                    upstream.write_all(&auth_request).await?;
-                    stats.add_bytes_out(auth_request.len() as u64); // Track auth request bytes
+                        upstream.write_all(&auth_request).await?;
+                        stats.add_bytes_out(auth_request.len() as u64); // Track auth request bytes
 
-                    let mut auth_response = [0u8; 2];
-                    upstream.read_exact(&mut auth_response).await?;
-                    stats.add_bytes_in(2); // Track auth response bytes
+                        let mut auth_response = [0u8; 2];
+                        upstream.read_exact(&mut auth_response).await?;
+                        stats.add_bytes_in(2); // Track auth response bytes
+                        std::eprintln!("Upstream SOCKS5 auth response: {:?}", auth_response);
 
-                    if auth_response[1] != 0x00 {
-                        return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                        if auth_response[1] != 0x00 {
+                            return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                        }
+                        std::eprintln!("SOCKS5 authentication successful");
+                    } else {
+                        return Err(ProxyError::Protocol("Username/password required but not provided".into()));
                     }
+                } else if response[1] == 0x00 {
+                    std::eprintln!("Upstream selected no authentication");
+                } else {
+                    return Err(ProxyError::Protocol("Upstream SOCKS5 handshake failed".into()));
                 }
 
+                std::eprintln!("Sending SOCKS5 request to upstream...");
                 upstream.write_all(&buf).await?;
                 stats.add_bytes_out(buf.len().try_into().unwrap()); // Track request bytes
 
+                std::eprintln!("Reading upstream SOCKS5 response...");
                 let mut response = [0u8; 4];
                 upstream.read_exact(&mut response).await?;
                 stats.add_bytes_in(4u64); // Track response bytes
+                std::eprintln!("Upstream SOCKS5 response: {:?}", response);
+                
+                // Check if upstream connection was successful
+                if response[1] != 0x00 {
+                    // Send error response to client - use the same address type as the original request
+                    let mut error_response = vec![
+                        0x05, // SOCKS version
+                        response[1], // Error code from upstream
+                        0x00, // Reserved
+                    ];
+                    
+                    // Use the same address type as the original request
+                    match header[3] {
+                        0x01 => { // IPv4
+                            error_response.push(0x01); // IPv4
+                            error_response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IP (4 bytes)
+                            error_response.extend_from_slice(&[0x00, 0x00]); // Port (2 bytes)
+                        }
+                        0x03 => { // Domain
+                            error_response.push(0x03); // Domain
+                            error_response.push(0x00); // Domain length
+                            error_response.extend_from_slice(&[0x00, 0x00]); // Port (2 bytes)
+                        }
+                        0x04 => { // IPv6
+                            error_response.push(0x04); // IPv6
+                            error_response.extend_from_slice(&[0x00; 16]); // IP (16 bytes)
+                            error_response.extend_from_slice(&[0x00, 0x00]); // Port (2 bytes)
+                        }
+                        _ => {
+                            return Err(ProxyError::Protocol("Invalid address type".into()));
+                        }
+                    }
+                    
+                    client.write_all(&error_response).await?;
+                    stats.add_bytes_out(error_response.len().try_into().unwrap());
+                    return Err(ProxyError::Protocol("Upstream SOCKS5 connection failed".into()));
+                }
+                
+                // Forward successful response to client
                 client.write_all(&response).await?;
                 stats.add_bytes_out(4u64); // Track response bytes
 
