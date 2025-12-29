@@ -241,12 +241,16 @@ impl StatsDisplay {
         let mut interval = interval(self.update_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_stats = None;
+        let mut last_db_stats = None;
         let mut has_new_logs = false;
+        let mut ticks_since_db_update = 0;
+        const DB_UPDATE_INTERVAL_TICKS: u32 = 5; // Update DB every 5 ticks (10s if tick is 2s)
 
         stdout.queue(cursor::Hide)?;
 
         loop {
             interval.tick().await;
+            ticks_since_db_update += 1;
 
             // Process any new logs
             while let Ok((message, level)) = self.log_rx.try_recv() {
@@ -267,7 +271,7 @@ impl StatsDisplay {
             }
 
             let stats = self.stats.get_stats();
-            
+
             // Only refresh if stats have changed or there are new logs
             let stats_changed = last_stats.as_ref().map_or(true, |last: &GlobalStatsSnapshot| {
                 last.current_bytes_in != stats.current_bytes_in ||
@@ -286,8 +290,22 @@ impl StatsDisplay {
                 has_new_logs = false;
             }
 
-            // Record statistics in the database
-            self.record_stats_in_db(&stats).await?;
+            // Record statistics in the database less frequently
+            let db_stats_changed = last_db_stats.as_ref().map_or(true, |last: &GlobalStatsSnapshot| {
+                last.total_connections != stats.total_connections ||
+                last.failed_connections != stats.failed_connections ||
+                last.succeeded_connections != stats.succeeded_connections ||
+                last.total_bytes_in != stats.total_bytes_in ||
+                last.total_bytes_out != stats.total_bytes_out
+            });
+
+            if ticks_since_db_update >= DB_UPDATE_INTERVAL_TICKS || db_stats_changed {
+                if let Err(e) = self.record_stats_in_db(&stats).await {
+                    eprintln!("Failed to update database: {}", e);
+                }
+                last_db_stats = Some(stats.clone());
+                ticks_since_db_update = 0;
+            }
         }
     }
 

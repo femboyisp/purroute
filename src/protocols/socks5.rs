@@ -10,13 +10,16 @@
 use crate::{
     config::{encode_auth, ProxyConfig},
     protocols::{Proxy, ProxyError},
-    stats::{get_global_stats, GlobalStats},
+    stats::get_global_stats,
 };
 use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+
+use crate::config::RouterConfig;
+use tokio_postgres::Client as DbClient;
 
 pub struct Socks5;
 
@@ -26,14 +29,9 @@ impl Socks5 {
         upstream_addr: &str,
         request: Vec<u8>,
         target_proxy: &ProxyConfig,
-        proxy_data: impl Fn(
-            TcpStream,
-            TcpStream,
-            Arc<GlobalStats>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>,
-        >,
-    ) -> Result<(), ProxyError> {
+        config: Arc<RouterConfig>,
+        db_client: Arc<DbClient>,
+    ) -> Result<(Option<i64>, TcpStream, TcpStream), ProxyError> {
         let mut client = client;
         let stats = get_global_stats();
 
@@ -56,22 +54,100 @@ impl Socks5 {
         if request.len() < 2 + nmethods as usize {
             return Err(ProxyError::Protocol("Invalid SOCKS5 greeting: insufficient methods".into()));
         }
-        
-        // Check if client supports no authentication (0x00)
+
+        // Check what methods client supports
         let methods = &request[2..2 + nmethods as usize];
         let supports_no_auth = methods.contains(&0x00);
-        
-        if !supports_no_auth {
-            return Err(ProxyError::Protocol("Client does not support no authentication".into()));
+        let supports_user_pass = methods.contains(&0x02);
+
+        // Determine which method to use based on config
+        let auth_enabled = config.auth.unwrap_or(false);
+        let mut user_account: Option<i64> = None;
+
+        if auth_enabled {
+            // Auth is required - use username/password method (0x02)
+            if !supports_user_pass {
+                // Client doesn't support username/password auth
+                client.write_all(&[0x05, 0xFF]).await?; // 0xFF = no acceptable methods
+                stats.add_bytes_out(2u64);
+                return Err(ProxyError::AuthFailed);
+            }
+
+            // Select method 0x02 (username/password)
+            client.write_all(&[0x05, 0x02]).await?;
+            stats.add_bytes_out(2u64);
+
+            // Perform RFC 1929 username/password authentication
+            let mut auth_request = [0u8; 513]; // Max size: 1 + 1 + 255 + 1 + 255
+            let auth_len = client.read(&mut auth_request).await?;
+            stats.add_bytes_in(auth_len as u64);
+
+            if auth_len < 3 || auth_request[0] != 0x01 {
+                return Err(ProxyError::Protocol("Invalid SOCKS5 auth request".into()));
+            }
+
+            let ulen = auth_request[1] as usize;
+            if auth_len < 2 + ulen + 1 {
+                return Err(ProxyError::Protocol("Invalid SOCKS5 auth username length".into()));
+            }
+
+            let username = String::from_utf8_lossy(&auth_request[2..2 + ulen]).to_string();
+            let plen = auth_request[2 + ulen] as usize;
+
+            if auth_len < 2 + ulen + 1 + plen {
+                return Err(ProxyError::Protocol("Invalid SOCKS5 auth password length".into()));
+            }
+
+            let password = String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen]).to_string();
+
+            // Authenticate against database
+            let query = "
+                SELECT account, bandwidth_limit
+                FROM public.accounts
+                WHERE username = $1 AND password = $2
+            ";
+
+            match db_client.query_opt(query, &[&username, &password]).await {
+                Ok(Some(row)) => {
+                    let account_id: i64 = row.get(0);
+                    let bandwidth_limit: i64 = row.get(1);
+
+                    // Check bandwidth
+                    if bandwidth_limit <= 0 {
+                        stats.log_info(
+                            format!("User {} has no bandwidth remaining", username),
+                            &config,
+                        );
+                        client.write_all(&[0x01, 0x01]).await?; // Auth failed
+                        stats.add_bytes_out(2u64);
+                        return Err(ProxyError::BandwidthExceeded);
+                    }
+
+                    user_account = Some(account_id);
+                    // Auth success
+                    client.write_all(&[0x01, 0x00]).await?;
+                    stats.add_bytes_out(2u64);
+                }
+                Ok(None) | Err(_) => {
+                    // Auth failed
+                    client.write_all(&[0x01, 0x01]).await?;
+                    stats.add_bytes_out(2u64);
+                    return Err(ProxyError::AuthFailed);
+                }
+            }
+        } else {
+            // No auth required - use method 0x00
+            if !supports_no_auth {
+                // Client doesn't support no auth
+                client.write_all(&[0x05, 0xFF]).await?; // No acceptable methods
+                stats.add_bytes_out(2u64);
+                return Err(ProxyError::Protocol("Client does not support no authentication".into()));
+            }
+
+            // Select method 0x00 (no authentication)
+            client.write_all(&[0x05, 0x00]).await?;
+            stats.add_bytes_out(2u64);
         }
-        
-        // SOCKS5 handshake response: version 5, no authentication required
-        client.write_all(&[0x05, 0x00]).await?;
-        stats.add_bytes_out(2u64); // Track response bytes [0x05, 0x00]
-        
-        // Debug logging
-        std::eprintln!("SOCKS5 handshake completed: version={}, methods={:?}", version, methods);
-        std::eprintln!("Reading SOCKS5 request...");
 
         // Now read the SOCKS5 request
         let mut buf = Vec::new();
@@ -140,6 +216,7 @@ impl Socks5 {
         std::eprintln!("SOCKS5 target: {}:{}", target_host, target_port);
 
         let mut upstream = TcpStream::connect(upstream_addr).await?;
+        upstream.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
         std::eprintln!("Connected to upstream proxy: {}", upstream_addr);
 
         match target_proxy.proxy_type {
@@ -367,6 +444,6 @@ impl Socks5 {
             }
         }
 
-        proxy_data(client, upstream, stats).await
+        Ok((user_account, client, upstream))
     }
 }

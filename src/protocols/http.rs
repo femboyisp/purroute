@@ -36,6 +36,7 @@ impl Http {
 
         let mut client = client;
         let mut upstream = TcpStream::connect(upstream_addr).await?;
+        upstream.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
         let stats = get_global_stats();
 
         match target_proxy.proxy_type {
