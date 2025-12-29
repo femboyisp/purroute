@@ -4,6 +4,14 @@ log = true
 verbose = true
 debug = true
 auth = true
+# chain = "Tor"                                  # Single mode: Use a single proxy by label
+# chain = "strict-chain"                         # Strict mode: Use a chain in order
+# chain = "random-chain"                         # Random mode: Pick random proxy(ies) from chain
+
+[api]
+listen = "127.0.0.1:6969"
+api_key = "your-secret-api-key-here"
+enabled = true
 
 [database]
 host = "localhost"
@@ -20,7 +28,33 @@ proxy_type = "Socks5"
 address = "127.0.0.1:9050"                      # If port is not specified (ie: in onion/i2p addresses) we default to 80
 
 [[proxy]]
+label = "HttpProxy"
 proxy_type = "Http"                             # If just Http or Https is specified then it will be strictly that protocol
 address = "proxy2.example.com:8080"             # If port is not specified (ie: in onion/i2p addresses) we default to 80
 username = "user123"                            # (Optional) Username for proxy authentication
 password = "pass456"                            # (Optional) Password for proxy authentication
+
+[[proxy]]
+label = "Kitty"
+proxy_type = "Socks5"
+address = "kitty.example.com:1080"
+
+# Chain configurations
+# Strict mode: Use proxies in exact order
+[[chain]]
+chain_id = "strict-chain"
+mode = "strict"                                 # Use proxies in the order specified
+proxies = ["Tor", "HttpProxy"]                  # Will always go: Tor -> HttpProxy
+
+# Random mode: Pick one random proxy from the list
+[[chain]]
+chain_id = "random-chain"
+mode = "random"                                 # Randomly select from the list
+proxies = ["Tor", "HttpProxy", "Kitty"]         # Will pick ONE random proxy on each connection
+
+# Random mode with count: Pick multiple random proxies
+[[chain]]
+chain_id = "random-multi"
+mode = "random"
+count = 2                                       # Pick 2 random proxies from the list
+proxies = ["Tor", "HttpProxy", "Kitty"]         # Will pick TWO random proxies and chain them

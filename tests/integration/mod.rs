@@ -5,9 +5,9 @@ use std::error::Error;
 
 const TEST_USER: &str = "testuser";
 const TEST_PASS: &str = "testpass";
-const TARGET_HOST: &str = "172.21.0.5:80"; // For SOCKS proxies
-const TARGET_URL: &str = "http://target:80"; // For HTTP proxies
-const HTTPS_TEST_URL: &str = "https://httpbin.org/get";
+const TARGET_HOST: &str = "104.18.26.120:80"; // For SOCKS proxies
+const TARGET_URL: &str = "http://example.com"; // For HTTP proxies
+const HTTPS_TEST_URL: &str = "https://httpbin.org/get"; // TODO: change to a local server
 
 async fn wait_for_services() {
     // Wait for services to be ready

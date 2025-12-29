@@ -8,32 +8,20 @@
 use tokio::time::Duration;
 use tokio_postgres::{Client, Config, Error, NoTls};
 
-use rand::Rng;
 use std::sync::Arc;
 
+mod api;
 mod config;
 mod protocols;
 mod stats;
 
 use crate::{
-    config::{load_config, RouterConfig},
+    config::load_config,
     protocols::ProxyServer,
     stats::{display::StatsDisplay, get_global_stats},
 };
 
-fn generate_random_string(length: usize) -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                            abcdefghijklmnopqrstuvwxyz\
-                            0123456789";
-    let mut rng = rand::rng();
-    (0..length)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
-}
-async fn initialize_database(client: &Client, router_config: &RouterConfig) -> Result<(), Error> {
+async fn initialize_database(client: &Client) -> Result<(), Error> {
     // Create sequence for account IDs if it doesn't exist
     client
         .execute(
@@ -108,50 +96,44 @@ async fn initialize_database(client: &Client, router_config: &RouterConfig) -> R
         )
         .await?;
 
-    // Check if router debug is true and generate test accounts
-    if router_config.debug.unwrap_or(false) {
-        for i in 0..2 {
-            let new_username = generate_random_string(8);
-            let new_password = generate_random_string(12);
+    // Add bandwidth_limit column to accounts table
+    client
+        .execute(
+            "
+            ALTER TABLE public.accounts
+            ADD COLUMN IF NOT EXISTS bandwidth_limit BIGINT DEFAULT NULL;
+            ",
+            &[],
+        )
+        .await?;
 
-            // Insert new account and get the generated ID
-            let row = client
-                .query_one(
-                    "
-                    INSERT INTO public.accounts (proxy, username, password)
-                    VALUES ($1, $2, $3)
-                    RETURNING account
-                    ",
-                    &[&(i as i64), &new_username, &new_password],
-                )
-                .await?;
+    // Create indexes for performance
+    client
+        .execute(
+            "
+            CREATE INDEX IF NOT EXISTS idx_accounts_username
+            ON public.accounts(username);
+            ",
+            &[],
+        )
+        .await?;
 
-            let account_id: i64 = row.get(0);
-
-            // Initialize user_stats for the new account
-            client
-                .execute(
-                    "
-                    INSERT INTO public.user_stats (id)
-                    VALUES ($1)
-                    ",
-                    &[&account_id],
-                )
-                .await?;
-
-            println!(
-                "Generated account - ID: {}, Username: {}, Password: {}",
-                account_id, new_username, new_password
-            );
-        }
-    }
+    client
+        .execute(
+            "
+            CREATE INDEX IF NOT EXISTS idx_user_stats_id
+            ON public.user_stats(id);
+            ",
+            &[],
+        )
+        .await?;
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (router_config, proxy_chain, db_config) = load_config("config.toml")?;
+    let (router_config, proxy_chain, chains, db_config, api_config) = load_config("config.toml")?;
     let global_stats = get_global_stats();
 
     // Initialize the database connection
@@ -174,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Initialize the database
-    initialize_database(&db_client, &router_config).await?;
+    initialize_database(&db_client).await?;
 
     // Load stats from the database if configured
     if let Err(e) = global_stats.load_from_db(&db_client).await {
@@ -184,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create stats display for the server
     let stats_display = Arc::new(StatsDisplay::new(
         Arc::clone(&global_stats),
-        Duration::from_millis(500),
+        Duration::from_secs(2), // Reduced frequency from 500ms to 2s
         Arc::clone(&db_client),
     ));
 
@@ -193,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the proxy server with logger
     let server = ProxyServer::new(
         proxy_chain,
+        chains,
         Arc::clone(&stats_display),
         Arc::new(router_config.clone()),
         Arc::clone(&db_client),
@@ -203,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create a new display instance for the display task
         let display = StatsDisplay::new(
             Arc::clone(&global_stats),
-            Duration::from_millis(500),
+            Duration::from_secs(2), // Reduced frequency from 500ms to 2s
             Arc::clone(&db_client),
         );
         async move {
@@ -212,6 +195,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // Start API server if configured
+    if let Some(api_config) = api_config {
+        if api_config.enabled.unwrap_or(true) {
+            let api_db_client = Arc::clone(&db_client);
+            tokio::spawn(async move {
+                if let Err(e) = crate::api::run_api_server(api_config, api_db_client).await {
+                    eprintln!("API server error: {}", e);
+                }
+            });
+        }
+    }
 
     // Run the proxy server
     server.run(router_config.listen.parse()?).await?;

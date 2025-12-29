@@ -1,0 +1,76 @@
+[?25lAPI server listening on: 127.0.0.1:6969
+[1;1H[J[38;5;14m=== Purroute Proxy Statistics ===
+
+[38;5;7mActive Connections:      [38;5;10m0
+[38;5;7mTotal Connections:       [38;5;12m19
+[38;5;7mSucceeded Connections:   [38;5;10m1
+[38;5;7mFailed Connections:      [38;5;9m6
+
+[38;5;7mCurrent Download:        [38;5;11m0.00 B/s
+[38;5;7mCurrent Upload:          [38;5;11m0.00 B/s
+
+[38;5;7mTotal Download:          [38;5;13m1.13 KB
+[38;5;7mTotal Upload:            [38;5;13m717.00 B
+
+[38;5;14m=== Connection Logs ===
+[38;5;8m[10:44:22] [38;5;12mProxy server listening on 0.0.0.0:1337
+
+[38;5;7mPress Ctrl+C to exit[1;1H[J[38;5;14m=== Purroute Proxy Statistics ===
+
+[38;5;7mActive Connections:      [38;5;10m1
+[38;5;7mTotal Connections:       [38;5;12m20
+[38;5;7mSucceeded Connections:   [38;5;10m1
+[38;5;7mFailed Connections:      [38;5;9m6
+
+[38;5;7mCurrent Download:        [38;5;11m31.00 B/s
+[38;5;7mCurrent Upload:          [38;5;11m27.00 B/s
+
+[38;5;7mTotal Download:          [38;5;13m1.16 KB
+[38;5;7mTotal Upload:            [38;5;13m744.00 B
+
+[38;5;14m=== Connection Logs ===
+[38;5;8m[10:44:22] [38;5;12mProxy server listening on 0.0.0.0:1337
+[38;5;8m[10:44:27] [38;5;12mNew connection from 127.0.0.1:34780
+[38;5;8m[10:44:27] [38;5;12mProtocol Socks5 detected from 127.0.0.1:34780
+[38;5;8m[10:44:27] [38;5;12mUsing chain: Tor -> kitty (2 hops)
+
+[38;5;7mPress Ctrl+C to exit[1;1H[J[38;5;14m=== Purroute Proxy Statistics ===
+
+[38;5;7mActive Connections:      [38;5;10m1
+[38;5;7mTotal Connections:       [38;5;12m20
+[38;5;7mSucceeded Connections:   [38;5;10m1
+[38;5;7mFailed Connections:      [38;5;9m6
+
+[38;5;7mCurrent Download:        [38;5;11m0.00 B/s
+[38;5;7mCurrent Upload:          [38;5;11m0.00 B/s
+
+[38;5;7mTotal Download:          [38;5;13m1.16 KB
+[38;5;7mTotal Upload:            [38;5;13m744.00 B
+
+[38;5;14m=== Connection Logs ===
+[38;5;8m[10:44:22] [38;5;12mProxy server listening on 0.0.0.0:1337
+[38;5;8m[10:44:27] [38;5;12mNew connection from 127.0.0.1:34780
+[38;5;8m[10:44:27] [38;5;12mProtocol Socks5 detected from 127.0.0.1:34780
+[38;5;8m[10:44:27] [38;5;12mUsing chain: Tor -> kitty (2 hops)
+
+[38;5;7mPress Ctrl+C to exit[1;1H[J[38;5;14m=== Purroute Proxy Statistics ===
+
+[38;5;7mActive Connections:      [38;5;10m0
+[38;5;7mTotal Connections:       [38;5;12m20
+[38;5;7mSucceeded Connections:   [38;5;10m1
+[38;5;7mFailed Connections:      [38;5;9m7
+
+[38;5;7mCurrent Download:        [38;5;11m0.00 B/s
+[38;5;7mCurrent Upload:          [38;5;11m0.00 B/s
+
+[38;5;7mTotal Download:          [38;5;13m1.16 KB
+[38;5;7mTotal Upload:            [38;5;13m744.00 B
+
+[38;5;14m=== Connection Logs ===
+[38;5;8m[10:44:22] [38;5;12mProxy server listening on 0.0.0.0:1337
+[38;5;8m[10:44:27] [38;5;12mNew connection from 127.0.0.1:34780
+[38;5;8m[10:44:27] [38;5;12mProtocol Socks5 detected from 127.0.0.1:34780
+[38;5;8m[10:44:27] [38;5;12mUsing chain: Tor -> kitty (2 hops)
+[38;5;8m[10:44:57] [38;5;9mConnection error from 127.0.0.1:34780: Protocol error: Timeout waiting for CONNECT response
+
+[38;5;7mPress Ctrl+C to exit
