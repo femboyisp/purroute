@@ -6,11 +6,10 @@
 /// The SOCKS4 protocol is simpler than SOCKS5 and only supports IPv4 addresses.
 // src/protocols/socks4.rs
 use crate::{
-    config::{ProxyConfig},
+    config::ProxyConfig,
     protocols::{Proxy, ProxyError},
     stats::{get_global_stats, GlobalStats},
 };
-use base64::Engine;
 use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -46,10 +45,15 @@ impl Socks4 {
         // Parse SOCKS4 request
         let command = request[1];
         if command != 0x01 {
-            return Err(ProxyError::Protocol("Only CONNECT command is supported".into()));
+            return Err(ProxyError::Protocol(
+                "Only CONNECT command is supported".into(),
+            ));
         }
         let port = u16::from_be_bytes([request[2], request[3]]);
-        let ip = format!("{}.{}.{}.{}", request[4], request[5], request[6], request[7]);
+        let ip = format!(
+            "{}.{}.{}.{}",
+            request[4], request[5], request[6], request[7]
+        );
 
         // Find the end of the user ID string
         let mut user_id_end = 8;
@@ -57,8 +61,8 @@ impl Socks4 {
             user_id_end += 1;
         }
 
-        // Extract user ID if present
-        let user_id = if user_id_end > 8 {
+        // The SOCKS4 user ID field is parsed past but not used for auth.
+        let _user_id = if user_id_end > 8 {
             String::from_utf8_lossy(&request[8..user_id_end]).to_string()
         } else {
             String::new()
@@ -72,7 +76,9 @@ impl Socks4 {
                 domain_end += 1;
             }
             if domain_end <= user_id_end + 1 {
-                return Err(ProxyError::Protocol("Invalid SOCKS4a request: missing domain".into()));
+                return Err(ProxyError::Protocol(
+                    "Invalid SOCKS4a request: missing domain".into(),
+                ));
             }
             String::from_utf8_lossy(&request[user_id_end + 1..domain_end]).to_string()
         } else {
@@ -89,9 +95,8 @@ impl Socks4 {
                 connect_request.extend_from_slice(
                     format!("CONNECT {}:{} HTTP/1.1\r\n", target_host, port).as_bytes(),
                 );
-                connect_request.extend_from_slice(
-                    format!("Host: {}:{}\r\n", target_host, port).as_bytes(),
-                );
+                connect_request
+                    .extend_from_slice(format!("Host: {}:{}\r\n", target_host, port).as_bytes());
 
                 // Add authentication if provided
                 if let (Some(username), Some(password)) =
@@ -144,13 +149,14 @@ impl Socks4 {
             }
             Proxy::Socks5 => {
                 // SOCKS5 handshake - offer both no auth and username/password auth
-                let handshake = if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
-                    // Offer both no auth and username/password auth
-                    vec![0x05, 0x02, 0x00, 0x02]
-                } else {
-                    // Only offer no auth
-                    vec![0x05, 0x01, 0x00]
-                };
+                let handshake =
+                    if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
+                        // Offer both no auth and username/password auth
+                        vec![0x05, 0x02, 0x00, 0x02]
+                    } else {
+                        // Only offer no auth
+                        vec![0x05, 0x01, 0x00]
+                    };
                 upstream.write_all(&handshake).await?;
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
@@ -177,13 +183,19 @@ impl Socks4 {
                         stats.add_bytes_in(2);
 
                         if auth_response[1] != 0x00 {
-                            return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                            return Err(ProxyError::Protocol(
+                                "SOCKS5 authentication failed".into(),
+                            ));
                         }
                     } else {
-                        return Err(ProxyError::Protocol("Username/password required but not provided".into()));
+                        return Err(ProxyError::Protocol(
+                            "Username/password required but not provided".into(),
+                        ));
                     }
                 } else if response[1] != 0x00 {
-                    return Err(ProxyError::Protocol("Upstream SOCKS5 handshake failed".into()));
+                    return Err(ProxyError::Protocol(
+                        "Upstream SOCKS5 handshake failed".into(),
+                    ));
                 }
 
                 // Create SOCKS5 connect request

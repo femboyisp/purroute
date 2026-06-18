@@ -52,8 +52,8 @@ impl ChainConnector {
             };
 
             // Establish connection through current proxy to next hop
-            stream = Self::connect_through_proxy(stream, current_proxy, &next_host, next_port)
-                .await?;
+            stream =
+                Self::connect_through_proxy(stream, current_proxy, &next_host, next_port).await?;
         }
 
         Ok(stream)
@@ -151,12 +151,17 @@ impl ChainConnector {
                 return Err(ProxyError::Io(e));
             }
             Err(_) => {
-                return Err(ProxyError::Protocol("Timeout waiting for CONNECT response".into()));
+                return Err(ProxyError::Protocol(
+                    "Timeout waiting for CONNECT response".into(),
+                ));
             }
         }
 
         if response[1] != 0x00 {
-            return Err(ProxyError::Protocol(format!("SOCKS5 connect failed with code {}", response[1])));
+            return Err(ProxyError::Protocol(format!(
+                "SOCKS5 connect failed with code {}",
+                response[1]
+            )));
         }
 
         // Skip address in response
@@ -234,7 +239,8 @@ impl ChainConnector {
         connect_request.extend_from_slice(
             format!("CONNECT {}:{} HTTP/1.1\r\n", target_host, target_port).as_bytes(),
         );
-        connect_request.extend_from_slice(format!("Host: {}:{}\r\n", target_host, target_port).as_bytes());
+        connect_request
+            .extend_from_slice(format!("Host: {}:{}\r\n", target_host, target_port).as_bytes());
 
         if let (Some(username), Some(password)) = (&proxy.username, &proxy.password) {
             let auth = encode_auth(username, password);

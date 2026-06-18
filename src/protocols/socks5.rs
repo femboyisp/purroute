@@ -19,7 +19,6 @@ use tokio::{
 };
 
 use crate::config::RouterConfig;
-use tokio_postgres::Client as DbClient;
 
 pub struct Socks5;
 
@@ -30,29 +29,33 @@ impl Socks5 {
         request: Vec<u8>,
         target_proxy: &ProxyConfig,
         config: Arc<RouterConfig>,
-        db_client: Arc<DbClient>,
+        auth: &dyn crate::auth::AuthBackend,
     ) -> Result<(Option<i64>, TcpStream, TcpStream), ProxyError> {
         let mut client = client;
         let stats = get_global_stats();
 
         // Track initial handshake bytes
         stats.add_bytes_in(request.len().try_into().unwrap());
-        
+
         // Parse the initial SOCKS5 greeting
         if request.len() < 3 {
-            return Err(ProxyError::Protocol("Invalid SOCKS5 greeting length".into()));
+            return Err(ProxyError::Protocol(
+                "Invalid SOCKS5 greeting length".into(),
+            ));
         }
-        
+
         let version = request[0];
         let nmethods = request[1];
-        
+
         if version != 0x05 {
             return Err(ProxyError::Protocol("Invalid SOCKS5 version".into()));
         }
-        
+
         // Check if we have enough bytes for the methods
         if request.len() < 2 + nmethods as usize {
-            return Err(ProxyError::Protocol("Invalid SOCKS5 greeting: insufficient methods".into()));
+            return Err(ProxyError::Protocol(
+                "Invalid SOCKS5 greeting: insufficient methods".into(),
+            ));
         }
 
         // Check what methods client supports
@@ -88,34 +91,31 @@ impl Socks5 {
 
             let ulen = auth_request[1] as usize;
             if auth_len < 2 + ulen + 1 {
-                return Err(ProxyError::Protocol("Invalid SOCKS5 auth username length".into()));
+                return Err(ProxyError::Protocol(
+                    "Invalid SOCKS5 auth username length".into(),
+                ));
             }
 
             let username = String::from_utf8_lossy(&auth_request[2..2 + ulen]).to_string();
             let plen = auth_request[2 + ulen] as usize;
 
             if auth_len < 2 + ulen + 1 + plen {
-                return Err(ProxyError::Protocol("Invalid SOCKS5 auth password length".into()));
+                return Err(ProxyError::Protocol(
+                    "Invalid SOCKS5 auth password length".into(),
+                ));
             }
 
-            let password = String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen]).to_string();
+            let password =
+                String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen])
+                    .to_string();
 
-            // Authenticate against database
-            let query = "
-                SELECT account, bandwidth_limit
-                FROM public.accounts
-                WHERE username = $1 AND password = $2
-            ";
-
-            match db_client.query_opt(query, &[&username, &password]).await {
-                Ok(Some(row)) => {
-                    let account_id: i64 = row.get(0);
-                    let bandwidth_limit: i64 = row.get(1);
-
-                    // Check bandwidth
-                    if bandwidth_limit <= 0 {
+            // Authenticate via the pluggable auth backend.
+            match auth.authenticate(&username, &password).await {
+                Ok(Some(account)) => {
+                    // Reject if a (non-null) bandwidth limit is exhausted.
+                    if matches!(account.bandwidth_limit, Some(limit) if limit <= 0) {
                         stats.log_info(
-                            format!("User {} has no bandwidth remaining", username),
+                            format!("User {username} has no bandwidth remaining"),
                             &config,
                         );
                         client.write_all(&[0x01, 0x01]).await?; // Auth failed
@@ -123,7 +123,7 @@ impl Socks5 {
                         return Err(ProxyError::BandwidthExceeded);
                     }
 
-                    user_account = Some(account_id);
+                    user_account = Some(account.id);
                     // Auth success
                     client.write_all(&[0x01, 0x00]).await?;
                     stats.add_bytes_out(2u64);
@@ -141,7 +141,9 @@ impl Socks5 {
                 // Client doesn't support no auth
                 client.write_all(&[0x05, 0xFF]).await?; // No acceptable methods
                 stats.add_bytes_out(2u64);
-                return Err(ProxyError::Protocol("Client does not support no authentication".into()));
+                return Err(ProxyError::Protocol(
+                    "Client does not support no authentication".into(),
+                ));
             }
 
             // Select method 0x00 (no authentication)
@@ -163,7 +165,6 @@ impl Socks5 {
         }
 
         // Read address and port based on ATYP
-        std::eprintln!("SOCKS5 request header: {:?}", header);
         let (target_host, target_port) = match header[3] {
             0x01 => {
                 // IPv4: 4 bytes address + 2 bytes port
@@ -212,12 +213,9 @@ impl Socks5 {
             }
             _ => return Err(ProxyError::Protocol("Unsupported address type".into())),
         };
-        
-        std::eprintln!("SOCKS5 target: {}:{}", target_host, target_port);
 
         let mut upstream = TcpStream::connect(upstream_addr).await?;
         upstream.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
-        std::eprintln!("Connected to upstream proxy: {}", upstream_addr);
 
         match target_proxy.proxy_type {
             Proxy::Http | Proxy::Https => {
@@ -304,30 +302,27 @@ impl Socks5 {
                 stats.add_bytes_out(response.len().try_into().unwrap());
             }
             Proxy::Socks5 => {
-                std::eprintln!("Starting SOCKS5 handshake with upstream...");
                 // SOCKS5 handshake with upstream - offer both no auth and username/password auth
-                let handshake = if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
-                    // Offer both no auth and username/password auth
-                    vec![0x05, 0x02, 0x00, 0x02]
-                } else {
-                    // Only offer no auth
-                    vec![0x05, 0x01, 0x00]
-                };
+                let handshake =
+                    if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
+                        // Offer both no auth and username/password auth
+                        vec![0x05, 0x02, 0x00, 0x02]
+                    } else {
+                        // Only offer no auth
+                        vec![0x05, 0x01, 0x00]
+                    };
                 upstream.write_all(&handshake).await?;
                 stats.add_bytes_out(handshake.len().try_into().unwrap()); // Track handshake bytes
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
                 stats.add_bytes_in(2u64); // Track response bytes
-                std::eprintln!("Upstream SOCKS5 handshake response: {:?}", response);
 
                 // Check if upstream selected username/password authentication
                 if response[1] == 0x02 {
-                    std::eprintln!("Upstream selected username/password authentication");
                     // handle user authentication
                     if let (Some(username), Some(password)) =
                         (&target_proxy.username, &target_proxy.password)
                     {
-                        std::eprintln!("Sending SOCKS5 authentication...");
                         // Send username/password authentication request
                         let mut auth_request = Vec::new();
                         auth_request.push(0x01); // Username/Password authentication version
@@ -342,53 +337,56 @@ impl Socks5 {
                         let mut auth_response = [0u8; 2];
                         upstream.read_exact(&mut auth_response).await?;
                         stats.add_bytes_in(2); // Track auth response bytes
-                        std::eprintln!("Upstream SOCKS5 auth response: {:?}", auth_response);
 
                         if auth_response[1] != 0x00 {
-                            return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                            return Err(ProxyError::Protocol(
+                                "SOCKS5 authentication failed".into(),
+                            ));
                         }
-                        std::eprintln!("SOCKS5 authentication successful");
                     } else {
-                        return Err(ProxyError::Protocol("Username/password required but not provided".into()));
+                        return Err(ProxyError::Protocol(
+                            "Username/password required but not provided".into(),
+                        ));
                     }
                 } else if response[1] == 0x00 {
-                    std::eprintln!("Upstream selected no authentication");
                 } else {
-                    return Err(ProxyError::Protocol("Upstream SOCKS5 handshake failed".into()));
+                    return Err(ProxyError::Protocol(
+                        "Upstream SOCKS5 handshake failed".into(),
+                    ));
                 }
 
-                std::eprintln!("Sending SOCKS5 request to upstream...");
                 upstream.write_all(&buf).await?;
                 stats.add_bytes_out(buf.len().try_into().unwrap()); // Track request bytes
 
-                std::eprintln!("Reading upstream SOCKS5 response...");
                 let mut response = [0u8; 4];
                 upstream.read_exact(&mut response).await?;
                 stats.add_bytes_in(4u64); // Track response bytes
-                std::eprintln!("Upstream SOCKS5 response: {:?}", response);
-                
+
                 // Check if upstream connection was successful
                 if response[1] != 0x00 {
                     // Send error response to client - use the same address type as the original request
                     let mut error_response = vec![
-                        0x05, // SOCKS version
+                        0x05,        // SOCKS version
                         response[1], // Error code from upstream
-                        0x00, // Reserved
+                        0x00,        // Reserved
                     ];
-                    
+
                     // Use the same address type as the original request
                     match header[3] {
-                        0x01 => { // IPv4
+                        0x01 => {
+                            // IPv4
                             error_response.push(0x01); // IPv4
                             error_response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IP (4 bytes)
                             error_response.extend_from_slice(&[0x00, 0x00]); // Port (2 bytes)
                         }
-                        0x03 => { // Domain
+                        0x03 => {
+                            // Domain
                             error_response.push(0x03); // Domain
                             error_response.push(0x00); // Domain length
                             error_response.extend_from_slice(&[0x00, 0x00]); // Port (2 bytes)
                         }
-                        0x04 => { // IPv6
+                        0x04 => {
+                            // IPv6
                             error_response.push(0x04); // IPv6
                             error_response.extend_from_slice(&[0x00; 16]); // IP (16 bytes)
                             error_response.extend_from_slice(&[0x00, 0x00]); // Port (2 bytes)
@@ -397,12 +395,14 @@ impl Socks5 {
                             return Err(ProxyError::Protocol("Invalid address type".into()));
                         }
                     }
-                    
+
                     client.write_all(&error_response).await?;
                     stats.add_bytes_out(error_response.len().try_into().unwrap());
-                    return Err(ProxyError::Protocol("Upstream SOCKS5 connection failed".into()));
+                    return Err(ProxyError::Protocol(
+                        "Upstream SOCKS5 connection failed".into(),
+                    ));
                 }
-                
+
                 // Forward successful response to client
                 client.write_all(&response).await?;
                 stats.add_bytes_out(4u64); // Track response bytes

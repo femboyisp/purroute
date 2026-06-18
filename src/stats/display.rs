@@ -99,7 +99,7 @@ impl StatsDisplay {
             LogLevel::Success => Color::Green,
         };
 
-        let timestamp = DateTime::from_timestamp(entry.timestamp as i64, 0)
+        let timestamp = DateTime::from_timestamp(entry.timestamp, 0)
             .map(|dt| dt.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "??:??:??".to_string());
 
@@ -273,16 +273,18 @@ impl StatsDisplay {
             let stats = self.stats.get_stats();
 
             // Only refresh if stats have changed or there are new logs
-            let stats_changed = last_stats.as_ref().map_or(true, |last: &GlobalStatsSnapshot| {
-                last.current_bytes_in != stats.current_bytes_in ||
-                last.current_bytes_out != stats.current_bytes_out ||
-                last.total_bytes_in != stats.total_bytes_in ||
-                last.total_bytes_out != stats.total_bytes_out ||
-                last.active_connections != stats.active_connections ||
-                last.total_connections != stats.total_connections ||
-                last.failed_connections != stats.failed_connections ||
-                last.succeeded_connections != stats.succeeded_connections
-            });
+            let stats_changed = last_stats
+                .as_ref()
+                .is_none_or(|last: &GlobalStatsSnapshot| {
+                    last.current_bytes_in != stats.current_bytes_in
+                        || last.current_bytes_out != stats.current_bytes_out
+                        || last.total_bytes_in != stats.total_bytes_in
+                        || last.total_bytes_out != stats.total_bytes_out
+                        || last.active_connections != stats.active_connections
+                        || last.total_connections != stats.total_connections
+                        || last.failed_connections != stats.failed_connections
+                        || last.succeeded_connections != stats.succeeded_connections
+                });
 
             if has_new_logs || stats_changed {
                 self.refresh_display(&stats, &config)?;
@@ -291,13 +293,16 @@ impl StatsDisplay {
             }
 
             // Record statistics in the database less frequently
-            let db_stats_changed = last_db_stats.as_ref().map_or(true, |last: &GlobalStatsSnapshot| {
-                last.total_connections != stats.total_connections ||
-                last.failed_connections != stats.failed_connections ||
-                last.succeeded_connections != stats.succeeded_connections ||
-                last.total_bytes_in != stats.total_bytes_in ||
-                last.total_bytes_out != stats.total_bytes_out
-            });
+            let db_stats_changed =
+                last_db_stats
+                    .as_ref()
+                    .is_none_or(|last: &GlobalStatsSnapshot| {
+                        last.total_connections != stats.total_connections
+                            || last.failed_connections != stats.failed_connections
+                            || last.succeeded_connections != stats.succeeded_connections
+                            || last.total_bytes_in != stats.total_bytes_in
+                            || last.total_bytes_out != stats.total_bytes_out
+                    });
 
             if ticks_since_db_update >= DB_UPDATE_INTERVAL_TICKS || db_stats_changed {
                 if let Err(e) = self.record_stats_in_db(&stats).await {
@@ -332,7 +337,7 @@ impl StatsDisplay {
                 &[&total_conn, &succ_conn, &fail_conn, &bytes_in, &bytes_out],
             )
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(())
     }

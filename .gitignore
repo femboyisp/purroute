@@ -1,3 +1,5 @@
 /target
+.env
 config.toml
-api_notes.txt
+*.swp
+.DS_Store

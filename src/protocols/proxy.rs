@@ -1,3 +1,5 @@
+use crate::auth::AuthBackend;
+use crate::protocol::Protocol as Proxy;
 /// PROXY Protocol
 /// This module implements the PROXY protocol for the proxy server.
 /// The PROXY protocol is a simple text-based protocol that is used to pass client connection information to the server.
@@ -7,26 +9,16 @@
 // src/protocols/proxy.rs
 use crate::{
     config::{ChainConfig, ProxyConfig, RouterConfig},
-    protocols::{ChainConnector, Http, Https, Socks5, Socks4},
+    protocols::{ChainConnector, Http, Https, Socks4, Socks5},
     stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
 use base64::Engine;
-use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tokio_postgres::Client;
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub enum Proxy {
-    Http,
-    Https,
-    Socks4,
-    Socks5,
-}
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
@@ -49,7 +41,7 @@ pub struct ProxyServer {
     proxy: Arc<Vec<ProxyConfig>>,
     chains: Arc<Option<Vec<ChainConfig>>>,
     config: Arc<RouterConfig>,
-    db_client: Arc<Client>,
+    auth: Arc<dyn AuthBackend>,
 }
 
 impl ProxyServer {
@@ -58,13 +50,13 @@ impl ProxyServer {
         chains: Option<Vec<ChainConfig>>,
         _logger: Arc<StatsDisplay>,
         config: Arc<RouterConfig>,
-        db_client: Arc<Client>,
+        auth: Arc<dyn AuthBackend>,
     ) -> Self {
         Self {
             proxy: Arc::new(proxy),
             chains: Arc::new(chains),
             config,
-            db_client,
+            auth,
         }
     }
 
@@ -73,7 +65,11 @@ impl ProxyServer {
         // If router.chain is specified, use that chain
         if let Some(chain_ref) = &self.config.chain {
             // First, try to find a single proxy by label (Single mode)
-            if let Some(proxy) = self.proxy.iter().find(|p| p.label.as_deref() == Some(chain_ref)) {
+            if let Some(proxy) = self
+                .proxy
+                .iter()
+                .find(|p| p.label.as_deref() == Some(chain_ref))
+            {
                 return Ok(vec![proxy.clone()]);
             }
 
@@ -82,15 +78,23 @@ impl ProxyServer {
                 let chain = chains
                     .iter()
                     .find(|c| &c.chain_id == chain_ref)
-                    .ok_or_else(|| ProxyError::Protocol(format!("Chain or proxy '{}' not found", chain_ref)))?;
+                    .ok_or_else(|| {
+                        ProxyError::Protocol(format!("Chain or proxy '{}' not found", chain_ref))
+                    })?;
 
                 // Collect all proxy configs from the chain
                 let mut proxy_configs = Vec::new();
                 for label in &chain.proxies {
-                    let proxy = self.proxy
+                    let proxy = self
+                        .proxy
                         .iter()
                         .find(|p| p.label.as_deref() == Some(label))
-                        .ok_or_else(|| ProxyError::Protocol(format!("Proxy '{}' not found in chain '{}'", label, chain_ref)))?
+                        .ok_or_else(|| {
+                            ProxyError::Protocol(format!(
+                                "Proxy '{}' not found in chain '{}'",
+                                label, chain_ref
+                            ))
+                        })?
                         .clone();
                     proxy_configs.push(proxy);
                 }
@@ -126,7 +130,9 @@ impl ProxyServer {
         }
 
         // Fallback: use first proxy (backward compatibility)
-        let proxy = self.proxy.first()
+        let proxy = self
+            .proxy
+            .first()
             .ok_or_else(|| ProxyError::Protocol("No proxy configuration available".to_string()))?
             .clone();
 
@@ -145,10 +151,12 @@ impl ProxyServer {
         let stats = get_global_stats();
 
         // Parse SOCKS5 greeting (already received in initial_request)
-        stats.add_bytes_in(initial_request.len() as u64);
+        stats.add_bytes_in(as_u64(initial_request.len()));
 
         if initial_request.len() < 3 {
-            return Err(ProxyError::Protocol("Invalid SOCKS5 greeting length".into()));
+            return Err(ProxyError::Protocol(
+                "Invalid SOCKS5 greeting length".into(),
+            ));
         }
 
         let version = initial_request[0];
@@ -185,7 +193,7 @@ impl ProxyServer {
             // Perform username/password authentication
             let mut auth_request = [0u8; 513];
             let auth_len = client.read(&mut auth_request).await?;
-            stats.add_bytes_in(auth_len as u64);
+            stats.add_bytes_in(as_u64(auth_len));
 
             if auth_len < 3 || auth_request[0] != 0x01 {
                 return Err(ProxyError::Protocol("Invalid SOCKS5 auth request".into()));
@@ -211,26 +219,16 @@ impl ProxyServer {
                 String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen])
                     .to_string();
 
-            // Verify credentials and check bandwidth
-            let row = self
-                .db_client
-                .query_one(
-                    "SELECT account, bandwidth_limit FROM public.accounts WHERE username = $1 AND password = $2",
-                    &[&username, &password],
-                )
+            // Verify credentials and check bandwidth via the auth backend.
+            let account = self
+                .auth
+                .authenticate(&username, &password)
                 .await
-                .map_err(|_| ProxyError::AuthFailed)?;
+                .map_err(|_| ProxyError::AuthFailed)?
+                .ok_or(ProxyError::AuthFailed)?;
 
-            let account_id: i64 = row.get(0);
-            let bandwidth_limit: Option<i64> = row.get(1);
-
-            if let Some(limit) = bandwidth_limit {
-                if limit <= 0 {
-                    return Err(ProxyError::BandwidthExceeded);
-                }
-            }
-
-            user_account = Some(account_id);
+            check_bandwidth(account.bandwidth_limit, &username, &self.config)?;
+            user_account = Some(account.id);
 
             client.write_all(&[0x01, 0x00]).await?;
             stats.add_bytes_out(2u64);
@@ -277,7 +275,7 @@ impl ProxyServer {
                 let domain_len = len[0] as usize;
                 let mut domain = vec![0u8; domain_len + 2];
                 client.read_exact(&mut domain).await?;
-                stats.add_bytes_in((domain_len as u64) + 2u64);
+                stats.add_bytes_in(as_u64(domain_len) + 2);
                 let hostname = String::from_utf8_lossy(&domain[..domain_len]).to_string();
                 let port = u16::from_be_bytes([domain[domain_len], domain[domain_len + 1]]);
                 (hostname, port)
@@ -305,12 +303,13 @@ impl ProxyServer {
         };
 
         // Use ChainConnector to establish upstream connection through the chain
-        let upstream = ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+        let upstream =
+            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
 
         // Send success response to client
         let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         client.write_all(&response).await?;
-        stats.add_bytes_out(response.len() as u64);
+        stats.add_bytes_out(as_u64(response.len()));
 
         global_stats.record_connection_result(
             true,
@@ -319,6 +318,105 @@ impl ProxyServer {
         );
 
         // Relay data between client and upstream
+        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
+            .await
+    }
+
+    /// Multi-hop SOCKS4/4a: parse the inbound CONNECT request, tunnel through
+    /// the chain, then relay.
+    async fn handle_socks4_chain(
+        &self,
+        mut client: TcpStream,
+        initial_request: Vec<u8>,
+        proxy_chain: Vec<ProxyConfig>,
+        peer_addr: SocketAddr,
+        global_stats: Arc<GlobalStats>,
+    ) -> Result<(), ProxyError> {
+        let stats = get_global_stats();
+        stats.add_bytes_in(as_u64(initial_request.len()));
+
+        let user_account = self.authenticate_user(&initial_request).await?;
+        let (target_host, target_port) = parse_socks4_target(&initial_request)?;
+
+        let upstream =
+            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+
+        // SOCKS4 success reply: VN=0x00, CD=0x5A (granted), 6 bytes ignored.
+        let response = [0x00, 0x5A, 0, 0, 0, 0, 0, 0];
+        client.write_all(&response).await?;
+        stats.add_bytes_out(as_u64(response.len()));
+
+        global_stats.record_connection_result(
+            true,
+            format!("SOCKS4 chain connection successful for {peer_addr}"),
+            &self.config,
+        );
+        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
+            .await
+    }
+
+    /// Multi-hop HTTPS (CONNECT) tunnel through the chain.
+    async fn handle_https_chain(
+        &self,
+        mut client: TcpStream,
+        initial_request: Vec<u8>,
+        proxy_chain: Vec<ProxyConfig>,
+        peer_addr: SocketAddr,
+        global_stats: Arc<GlobalStats>,
+    ) -> Result<(), ProxyError> {
+        let stats = get_global_stats();
+        stats.add_bytes_in(as_u64(initial_request.len()));
+
+        let user_account = self.authenticate_user(&initial_request).await?;
+        let (target_host, target_port) = parse_connect_target(&initial_request)?;
+
+        let upstream =
+            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+
+        let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+        client.write_all(response).await?;
+        stats.add_bytes_out(as_u64(response.len()));
+
+        global_stats.record_connection_result(
+            true,
+            format!("HTTPS chain connection successful for {peer_addr}"),
+            &self.config,
+        );
+        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
+            .await
+    }
+
+    /// Multi-hop plain HTTP: tunnel to the origin through the chain, then
+    /// forward the buffered request line + headers.
+    async fn handle_http_chain(
+        &self,
+        client: TcpStream,
+        initial_request: Vec<u8>,
+        proxy_chain: Vec<ProxyConfig>,
+        peer_addr: SocketAddr,
+        global_stats: Arc<GlobalStats>,
+    ) -> Result<(), ProxyError> {
+        let stats = get_global_stats();
+        stats.add_bytes_in(as_u64(initial_request.len()));
+
+        let user_account = self.authenticate_user(&initial_request).await?;
+        let (target_host, target_port) = parse_http_target(&initial_request)?;
+
+        let mut upstream =
+            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+
+        // Forward the request to the origin server through the chain, rewriting
+        // the absolute-form request line to origin-form so strict origins accept it.
+        let forwarded = to_origin_form(&initial_request);
+        upstream.write_all(&forwarded).await?;
+        upstream.flush().await?;
+        stats.add_bytes_out(as_u64(forwarded.len()));
+
+        global_stats.record_connection_result(
+            true,
+            format!("HTTP chain connection successful for {peer_addr}"),
+            &self.config,
+        );
         self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
             .await
     }
@@ -364,10 +462,19 @@ impl ProxyServer {
         let handle = tokio::spawn(async move {
             let result = async {
                 let mut buf = vec![0u8; 8192];
-                let n = client.read(&mut buf).await?;
+                // Bound the initial handshake read so stalled clients can't pin a task.
+                let n =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), client.read(&mut buf))
+                        .await
+                        .map_err(|_| ProxyError::Timeout)??;
                 let initial_request = buf[..n].to_vec();
 
                 let protocol = server.detect_protocol(&initial_request)?;
+                metrics::counter!(
+                    "purroute_connections_total",
+                    "protocol" => protocol.as_str(),
+                )
+                .increment(1);
                 global_stats.log_info(
                     format!("Protocol {:?} detected from {}", protocol, peer_addr),
                     &server.config,
@@ -377,13 +484,17 @@ impl ProxyServer {
                 let proxy_chain = server.resolve_proxy_chain()?;
                 let target_proxy = &proxy_chain[0];
 
+                metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
+
                 if proxy_chain.len() > 1 {
-                    let chain_desc: Vec<String> = proxy_chain
-                        .iter()
-                        .filter_map(|p| p.label.clone())
-                        .collect();
+                    let chain_desc: Vec<String> =
+                        proxy_chain.iter().filter_map(|p| p.label.clone()).collect();
                     global_stats.log_info(
-                        format!("Using chain: {} ({} hops)", chain_desc.join(" -> "), proxy_chain.len()),
+                        format!(
+                            "Using chain: {} ({} hops)",
+                            chain_desc.join(" -> "),
+                            proxy_chain.len()
+                        ),
                         &server.config,
                     );
                 } else if let Some(label) = &label {
@@ -393,36 +504,85 @@ impl ProxyServer {
                     );
                 }
 
+                // Multi-hop chains are handled by a protocol-agnostic path that
+                // performs the inbound handshake, tunnels through every hop via
+                // `ChainConnector`, then relays. Single-hop keeps the existing
+                // per-protocol translation handlers.
+                let multi_hop = proxy_chain.len() > 1;
+
                 match protocol {
-                    Proxy::Socks5 => {
-                        if proxy_chain.len() == 1 {
-                            // Single proxy: use existing logic
-                            let (user_account, client_stream, upstream_stream) = Socks5::handle(
+                    Proxy::Socks5 if multi_hop => {
+                        server
+                            .handle_socks5_chain(
                                 client,
-                                &target_proxy.get_upstream_addr(),
                                 initial_request,
-                                target_proxy,
-                                server.config.clone(),
-                                server.db_client.clone(),
+                                proxy_chain,
+                                peer_addr,
+                                global_stats.clone(),
                             )
-                            .await?;
+                            .await
+                    }
+                    Proxy::Socks4 if multi_hop => {
+                        server
+                            .handle_socks4_chain(
+                                client,
+                                initial_request,
+                                proxy_chain,
+                                peer_addr,
+                                global_stats.clone(),
+                            )
+                            .await
+                    }
+                    Proxy::Https if multi_hop => {
+                        server
+                            .handle_https_chain(
+                                client,
+                                initial_request,
+                                proxy_chain,
+                                peer_addr,
+                                global_stats.clone(),
+                            )
+                            .await
+                    }
+                    Proxy::Http if multi_hop => {
+                        server
+                            .handle_http_chain(
+                                client,
+                                initial_request,
+                                proxy_chain,
+                                peer_addr,
+                                global_stats.clone(),
+                            )
+                            .await
+                    }
+                    Proxy::Socks5 => {
+                        let (user_account, client_stream, upstream_stream) = Socks5::handle(
+                            client,
+                            &target_proxy.get_upstream_addr(),
+                            initial_request,
+                            target_proxy,
+                            server.config.clone(),
+                            server.auth.as_ref(),
+                        )
+                        .await?;
 
-                            global_stats.record_connection_result(
-                                true,
-                                format!("Socks5 Connection successful for {}", peer_addr),
-                                &server.config,
-                            );
+                        global_stats.record_connection_result(
+                            true,
+                            format!("Socks5 Connection successful for {}", peer_addr),
+                            &server.config,
+                        );
 
-                            server
-                                .proxy_data(client_stream, upstream_stream, peer_addr, global_stats.clone(), user_account)
-                                .await
-                        } else {
-                            // Multi-hop chain: handle client SOCKS5 handshake and use ChainConnector
-                            server.handle_socks5_chain(client, initial_request, proxy_chain, peer_addr, global_stats.clone()).await
-                        }
+                        server
+                            .proxy_data(
+                                client_stream,
+                                upstream_stream,
+                                peer_addr,
+                                global_stats.clone(),
+                                user_account,
+                            )
+                            .await
                     }
                     Proxy::Socks4 => {
-                        // Authenticate user for SOCKS4
                         let user_account = server.authenticate_user(&initial_request).await?;
 
                         Socks4::handle(
@@ -448,7 +608,6 @@ impl ProxyServer {
                         .await
                     }
                     Proxy::Http => {
-                        // Authenticate user for HTTP
                         let user_account = server.authenticate_user(&initial_request).await?;
 
                         Http::handle(
@@ -474,7 +633,6 @@ impl ProxyServer {
                         .await
                     }
                     Proxy::Https => {
-                        // Authenticate user for HTTPS
                         let user_account = server.authenticate_user(&initial_request).await?;
 
                         Https::handle(
@@ -513,7 +671,7 @@ impl ProxyServer {
     }
 
     pub fn detect_protocol(&self, request: &[u8]) -> Result<Proxy, ProxyError> {
-        if request.len() < 1 {
+        if request.is_empty() {
             return Err(ProxyError::Protocol("Request too short".into()));
         }
 
@@ -570,35 +728,17 @@ impl ProxyServer {
                 let username = parts.next().ok_or(ProxyError::AuthFailed)?;
                 let password = parts.next().ok_or(ProxyError::AuthFailed)?;
 
-                let query = "
-                       SELECT account, bandwidth_limit
-                       FROM public.accounts
-                       WHERE username = $1 AND password = $2
-                   ";
-
-                if let Some(row) = self
-                    .db_client
-                    .query_opt(query, &[&username, &password])
+                // Auth backend: handles the nullable `bandwidth_limit` correctly
+                // (NULL ⇒ no limit).
+                let account = self
+                    .auth
+                    .authenticate(username, password)
                     .await
                     .map_err(|_| ProxyError::AuthFailed)?
-                {
-                    let account_id: i64 = row.get(0);
-                    let bandwidth_limit: i64 = row.get(1);
+                    .ok_or(ProxyError::AuthFailed)?;
 
-                    // Check if user has bandwidth remaining
-                    if bandwidth_limit <= 0 {
-                        get_global_stats().log_info(
-                            format!("User {} has no bandwidth remaining ({})",
-                                username, bandwidth_limit),
-                            &self.config,
-                        );
-                        return Err(ProxyError::BandwidthExceeded);
-                    }
-
-                    return Ok(Some(account_id));
-                }
-
-                return Err(ProxyError::AuthFailed);
+                check_bandwidth(account.bandwidth_limit, username, &self.config)?;
+                return Ok(Some(account.id));
             }
         }
 
@@ -626,9 +766,13 @@ impl ProxyServer {
                 match client_reader.read(&mut buf).await {
                     Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
-                        stats.add_bytes_out(n.try_into().unwrap());
+                        stats.add_bytes_out(as_u64(n));
+                        metrics::counter!("purroute_bytes_out_total").increment(as_u64(n));
                         if let Some(id) = id {
-                            self.add_user_bytes_out(id, n.try_into().unwrap()).await?;
+                            self.auth
+                                .report_usage(id, 0, as_u64(n))
+                                .await
+                                .map_err(auth_io_error)?;
                         }
                         if let Err(e) = upstream_writer.write_all(&buf[..n]).await {
                             stats.record_connection_result(
@@ -667,9 +811,13 @@ impl ProxyServer {
                 match upstream_reader.read(&mut buf).await {
                     Ok(0) => break Ok(()), // Normal EOF
                     Ok(n) => {
-                        stats.add_bytes_in(n.try_into().unwrap());
+                        stats.add_bytes_in(as_u64(n));
+                        metrics::counter!("purroute_bytes_in_total").increment(as_u64(n));
                         if let Some(id) = id {
-                            self.add_user_bytes_in(id, n.try_into().unwrap()).await?;
+                            self.auth
+                                .report_usage(id, as_u64(n), 0)
+                                .await
+                                .map_err(auth_io_error)?;
                         }
                         if let Err(e) = client_writer.write_all(&buf[..n]).await {
                             stats.record_connection_result(
@@ -716,80 +864,281 @@ impl ProxyServer {
 
         result
     }
+}
 
-    async fn add_user_bytes_in(&self, id: i64, bytes: i64) -> Result<(), ProxyError> {
-        // Update user stats
-        let stats_query = "
-                UPDATE public.user_stats
-                SET total_bytes_in = total_bytes_in + $1
-                WHERE id = $2
-            ";
+/// Widen a buffer length to `u64` for byte counters (lengths never exceed u64).
+fn as_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
 
-        self.db_client
-            .execute(stats_query, &[&bytes, &id])
-            .await
-            .map_err(|e| {
-                ProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+/// Map an auth-backend error into a [`ProxyError`] without panicking.
+fn auth_io_error(e: crate::auth::AuthError) -> ProxyError {
+    ProxyError::Io(std::io::Error::other(e.to_string()))
+}
 
-        // Decrement bandwidth_limit
-        let limit_query = "
-                UPDATE public.accounts
-                SET bandwidth_limit = GREATEST(bandwidth_limit - $1, 0)
-                WHERE account = $2
-            ";
+/// Enforce a (possibly absent) bandwidth limit. `None` ⇒ no limit configured;
+/// `Some(n)` with `n <= 0` ⇒ the user is out of traffic.
+fn check_bandwidth(
+    limit: Option<i64>,
+    username: &str,
+    config: &RouterConfig,
+) -> Result<(), ProxyError> {
+    if let Some(limit) = limit {
+        if limit <= 0 {
+            get_global_stats().log_info(
+                format!("User {username} has no bandwidth remaining ({limit})"),
+                config,
+            );
+            return Err(ProxyError::BandwidthExceeded);
+        }
+    }
+    Ok(())
+}
 
-        self.db_client
-            .execute(limit_query, &[&bytes, &id])
-            .await
-            .map_err(|e| {
-                ProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+/// Rewrite a buffered plain-HTTP proxy request so its request line is in
+/// origin-form (`GET /path HTTP/1.1`) instead of the absolute-form
+/// (`GET http://host/path HTTP/1.1`) a proxy receives. Headers are left intact.
+///
+/// If the request line is already origin-form (or can't be parsed), the input is
+/// returned unchanged.
+fn to_origin_form(request: &[u8]) -> Vec<u8> {
+    // Only touch bytes up to the end of the first line; forward the rest verbatim
+    // so we never corrupt a request body.
+    let line_end = match request.windows(2).position(|w| w == b"\r\n") {
+        Some(idx) => idx,
+        None => return request.to_vec(),
+    };
+    let first_line = match std::str::from_utf8(&request[..line_end]) {
+        Ok(line) => line,
+        Err(_) => return request.to_vec(),
+    };
 
-        Ok(())
+    let mut parts = first_line.splitn(3, ' ');
+    let (Some(method), Some(uri), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return request.to_vec();
+    };
+
+    let stripped = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"));
+    let Some(rest) = stripped else {
+        return request.to_vec(); // already origin-form
+    };
+
+    // Drop the authority; keep the absolute path (everything from the first '/').
+    let path = match rest.find('/') {
+        Some(idx) => &rest[idx..],
+        None => "/",
+    };
+
+    let mut out = format!("{method} {path} {version}").into_bytes();
+    out.extend_from_slice(&request[line_end..]);
+    out
+}
+
+/// Split an `authority` (`host` or `host:port`) into host and port, using
+/// `default_port` when none is present.
+fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16), ProxyError> {
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse()
+                .map_err(|_| ProxyError::Protocol("invalid port".into()))?;
+            Ok((host.to_string(), port))
+        }
+        None => Ok((authority.to_string(), default_port)),
+    }
+}
+
+/// Parse the target `host:port` from an HTTP `CONNECT` request line.
+fn parse_connect_target(request: &[u8]) -> Result<(String, u16), ProxyError> {
+    let text = String::from_utf8_lossy(request);
+    let first = text
+        .lines()
+        .next()
+        .ok_or_else(|| ProxyError::Protocol("empty CONNECT request".into()))?;
+    let target = first
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| ProxyError::Protocol("malformed CONNECT line".into()))?;
+    split_host_port(target, 443)
+}
+
+/// Parse the origin `host:port` from a plain HTTP proxy request (absolute-form
+/// URI in the request line, falling back to the `Host` header).
+fn parse_http_target(request: &[u8]) -> Result<(String, u16), ProxyError> {
+    let text = String::from_utf8_lossy(request);
+    let first = text
+        .lines()
+        .next()
+        .ok_or_else(|| ProxyError::Protocol("empty HTTP request".into()))?;
+
+    if let Some(uri) = first.split_whitespace().nth(1) {
+        let stripped = uri
+            .strip_prefix("http://")
+            .or_else(|| uri.strip_prefix("https://"));
+        if let Some(rest) = stripped {
+            let authority = rest.split('/').next().unwrap_or(rest);
+            if !authority.is_empty() {
+                return split_host_port(authority, 80);
+            }
+        }
     }
 
-    async fn add_user_bytes_out(&self, id: i64, bytes: i64) -> Result<(), ProxyError> {
-        // Update user stats
-        let stats_query = "
-                        UPDATE public.user_stats
-                        SET total_bytes_out = total_bytes_out + $1
-                        WHERE id = $2
-                    ";
+    for line in text.lines() {
+        let header = line
+            .strip_prefix("Host:")
+            .or_else(|| line.strip_prefix("host:"));
+        if let Some(value) = header {
+            return split_host_port(value.trim(), 80);
+        }
+    }
+    Err(ProxyError::Protocol(
+        "no target host in HTTP request".into(),
+    ))
+}
 
-        self.db_client
-            .execute(stats_query, &[&bytes, &id])
-            .await
-            .map_err(|e| {
-                ProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+/// Parse the target `host:port` from a SOCKS4 or SOCKS4a CONNECT request.
+fn parse_socks4_target(request: &[u8]) -> Result<(String, u16), ProxyError> {
+    if request.len() < 9 || request[0] != 0x04 {
+        return Err(ProxyError::Protocol("invalid SOCKS4 request".into()));
+    }
+    let port = u16::from_be_bytes([request[2], request[3]]);
+    let ip = [request[4], request[5], request[6], request[7]];
+    // SOCKS4a: 0.0.0.x (x != 0) signals a domain name follows the user id.
+    let is_4a = ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0;
 
-        // Decrement bandwidth_limit
-        let limit_query = "
-                UPDATE public.accounts
-                SET bandwidth_limit = GREATEST(bandwidth_limit - $1, 0)
-                WHERE account = $2
-            ";
+    // Skip the null-terminated user id starting at offset 8.
+    let mut idx = 8;
+    while idx < request.len() && request[idx] != 0 {
+        idx += 1;
+    }
+    if idx >= request.len() {
+        return Err(ProxyError::Protocol("unterminated SOCKS4 user id".into()));
+    }
+    idx += 1; // skip the null terminator
 
-        self.db_client
-            .execute(limit_query, &[&bytes, &id])
-            .await
-            .map_err(|e| {
-                ProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+    if is_4a {
+        let start = idx;
+        while idx < request.len() && request[idx] != 0 {
+            idx += 1;
+        }
+        let host = String::from_utf8_lossy(&request[start..idx]).to_string();
+        Ok((host, port))
+    } else {
+        let host = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        Ok((host, port))
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_host_port_with_port() {
+        assert_eq!(
+            split_host_port("example.com:8443", 80).unwrap(),
+            ("example.com".to_string(), 8443)
+        );
+    }
+
+    #[test]
+    fn split_host_port_default() {
+        assert_eq!(
+            split_host_port("example.com", 80).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+    }
+
+    #[test]
+    fn split_host_port_rejects_bad_port() {
+        assert!(split_host_port("example.com:notaport", 80).is_err());
+    }
+
+    #[test]
+    fn connect_target_parses_host_port() {
+        let req =
+            b"CONNECT secure.example.com:443 HTTP/1.1\r\nHost: secure.example.com:443\r\n\r\n";
+        assert_eq!(
+            parse_connect_target(req).unwrap(),
+            ("secure.example.com".to_string(), 443)
+        );
+    }
+
+    #[test]
+    fn http_target_from_absolute_uri() {
+        let req = b"GET http://example.com:8080/path HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        assert_eq!(
+            parse_http_target(req).unwrap(),
+            ("example.com".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn http_target_from_host_header() {
+        let req = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(
+            parse_http_target(req).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+    }
+
+    #[test]
+    fn socks4a_target_parses_domain() {
+        // VN=4 CD=1 PORT=80 IP=0.0.0.1 USERID="" 0x00 DOMAIN 0x00
+        let mut req = vec![0x04, 0x01, 0x00, 0x50, 0x00, 0x00, 0x00, 0x01, 0x00];
+        req.extend_from_slice(b"example.com");
+        req.push(0x00);
+        assert_eq!(
+            parse_socks4_target(&req).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+    }
+
+    #[test]
+    fn origin_form_rewrites_absolute_uri() {
+        let req =
+            b"GET http://example.com:8080/path?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        let out = to_origin_form(req);
+        assert_eq!(
+            out,
+            b"GET /path?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn origin_form_handles_authority_only() {
+        let req = b"GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let out = to_origin_form(req);
+        assert_eq!(out, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec());
+    }
+
+    #[test]
+    fn origin_form_leaves_origin_form_unchanged() {
+        let req = b"GET /already/origin HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let out = to_origin_form(req);
+        assert_eq!(out, req.to_vec());
+    }
+
+    #[test]
+    fn origin_form_preserves_body_bytes() {
+        let req = b"POST http://h/x HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        let out = to_origin_form(req);
+        assert_eq!(
+            out,
+            b"POST /x HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc".to_vec()
+        );
+    }
+
+    #[test]
+    fn socks4_target_parses_ipv4() {
+        // VN=4 CD=1 PORT=443 IP=93.184.216.34 USERID="" 0x00
+        let req = vec![0x04, 0x01, 0x01, 0xBB, 93, 184, 216, 34, 0x00];
+        assert_eq!(
+            parse_socks4_target(&req).unwrap(),
+            ("93.184.216.34".to_string(), 443)
+        );
     }
 }
