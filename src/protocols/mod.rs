@@ -10,7 +10,10 @@ pub use self::{
     chain::ChainConnector,
     http::Http,
     https::Https,
-    proxy::{Proxy, ProxyError, ProxyServer},
+    proxy::{ProxyError, ProxyServer},
     socks4::Socks4,
     socks5::Socks5,
 };
+/// Re-export the crate's `Protocol` enum as `Proxy` for the existing
+/// `crate::protocols::Proxy` paths used throughout this module.
+pub use crate::protocol::Protocol as Proxy;

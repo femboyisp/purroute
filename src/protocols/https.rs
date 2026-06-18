@@ -126,13 +126,14 @@ impl Https {
                     .unwrap_or(443);
 
                 // SOCKS5 handshake - offer both no auth and username/password auth
-                let handshake = if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
-                    // Offer both no auth and username/password auth
-                    vec![0x05, 0x02, 0x00, 0x02]
-                } else {
-                    // Only offer no auth
-                    vec![0x05, 0x01, 0x00]
-                };
+                let handshake =
+                    if let (Some(_), Some(_)) = (&target_proxy.username, &target_proxy.password) {
+                        // Offer both no auth and username/password auth
+                        vec![0x05, 0x02, 0x00, 0x02]
+                    } else {
+                        // Only offer no auth
+                        vec![0x05, 0x01, 0x00]
+                    };
                 upstream.write_all(&handshake).await?;
                 let mut response = [0u8; 2];
                 upstream.read_exact(&mut response).await?;
@@ -159,13 +160,19 @@ impl Https {
                         stats.add_bytes_in(2);
 
                         if auth_response[1] != 0x00 {
-                            return Err(ProxyError::Protocol("SOCKS5 authentication failed".into()));
+                            return Err(ProxyError::Protocol(
+                                "SOCKS5 authentication failed".into(),
+                            ));
                         }
                     } else {
-                        return Err(ProxyError::Protocol("Username/password required but not provided".into()));
+                        return Err(ProxyError::Protocol(
+                            "Username/password required but not provided".into(),
+                        ));
                     }
                 } else if response[1] != 0x00 {
-                    return Err(ProxyError::Protocol("Upstream SOCKS5 handshake failed".into()));
+                    return Err(ProxyError::Protocol(
+                        "Upstream SOCKS5 handshake failed".into(),
+                    ));
                 }
 
                 let mut socks_request = vec![0x05, 0x01, 0x00, 0x03];

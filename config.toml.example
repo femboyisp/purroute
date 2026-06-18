@@ -7,11 +7,11 @@ auth = true
 # chain = "Tor"                                  # Single mode: Use a single proxy by label
 # chain = "strict-chain"                         # Strict mode: Use a chain in order
 # chain = "random-chain"                         # Random mode: Pick random proxy(ies) from chain
+metrics_listen = "127.0.0.1:9100"                # (Optional) Local-only Prometheus /metrics endpoint
 
-[api]
-listen = "127.0.0.1:6969"
-api_key = "your-secret-api-key-here"
-enabled = true
+# Accounts (username/password + bandwidth_limit) live in the `accounts` table.
+# The router reads them through its AuthBackend; create/manage them however you
+# like (direct SQL, your own service, etc.).
 
 [database]
 host = "localhost"
@@ -19,11 +19,10 @@ port = 5432
 user = "purroute"
 #password = "purroute"
 dbname = "purroute"
-tls = false
 
 # Individual proxy configurations (External Connections)
 [[proxy]] # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration
-label = "Tor"                          # Proxy types supported: Http, Https, Http|Https, Socks4, Socks4a, Socks5
+label = "Tor"                          # Proxy types supported: Http, Https, Socks4, Socks5
 proxy_type = "Socks5"
 address = "127.0.0.1:9050"                      # If port is not specified (ie: in onion/i2p addresses) we default to 80
 
