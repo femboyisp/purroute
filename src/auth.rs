@@ -14,19 +14,25 @@
 //! Implement the trait yourself (e.g. against a remote API) to plug in any other
 //! account source.
 
+use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ipnet::IpNet;
 use tokio_postgres::Client;
 
 use crate::config::UserConfig;
 
-/// A validated account: its id and remaining byte allowance (`None` = no limit).
-#[derive(Debug, Clone, Copy)]
+/// A validated account: its id, remaining byte allowance (`None` = no limit), and
+/// optional default routing selection (token format, applied when a connection
+/// requests none).
+#[derive(Debug, Clone)]
 pub struct Account {
     pub id: i64,
     pub bandwidth_limit: Option<i64>,
+    pub default_selection: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +50,12 @@ pub trait AuthBackend: Send + Sync {
         username: &str,
         secret: &str,
     ) -> Result<Option<Account>, AuthError>;
+
+    /// Authorise a connection by its source IP (allowlist). `Ok(None)` = the IP
+    /// is not authorised. Default: no IP auth.
+    async fn authenticate_by_ip(&self, _peer: IpAddr) -> Result<Option<Account>, AuthError> {
+        Ok(None)
+    }
 
     /// Record relayed bytes for an account and decrement its allowance.
     async fn report_usage(&self, id: i64, bytes_in: u64, bytes_out: u64) -> Result<(), AuthError>;
@@ -89,6 +101,19 @@ impl PostgresAuthBackend {
                 ALTER TABLE public.accounts
                     ADD COLUMN IF NOT EXISTS bandwidth_limit BIGINT DEFAULT NULL;
 
+                -- Default routing selection (username-token format), applied when
+                -- a connection requests none (e.g. IP-auth users).
+                ALTER TABLE public.accounts
+                    ADD COLUMN IF NOT EXISTS default_selection TEXT;
+
+                -- Source IPs / CIDRs allowed to authenticate by address.
+                CREATE TABLE IF NOT EXISTS public.account_ips (
+                    account BIGINT REFERENCES public.accounts(account),
+                    cidr TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_ips_account
+                    ON public.account_ips(account);
+
                 CREATE TABLE IF NOT EXISTS public.user_stats (
                     id BIGINT PRIMARY KEY,
                     total_connections BIGINT DEFAULT 0,
@@ -131,7 +156,7 @@ impl AuthBackend for PostgresAuthBackend {
         let row = self
             .client
             .query_opt(
-                "SELECT account, bandwidth_limit FROM public.accounts \
+                "SELECT account, bandwidth_limit, default_selection FROM public.accounts \
                  WHERE username = $1 AND password = $2",
                 &[&username, &secret],
             )
@@ -140,6 +165,26 @@ impl AuthBackend for PostgresAuthBackend {
         Ok(row.map(|row| Account {
             id: row.get(0),
             bandwidth_limit: row.get(1),
+            default_selection: row.get(2),
+        }))
+    }
+
+    async fn authenticate_by_ip(&self, peer: IpAddr) -> Result<Option<Account>, AuthError> {
+        let peer = peer.to_string();
+        let row = self
+            .client
+            .query_opt(
+                "SELECT a.account, a.bandwidth_limit, a.default_selection \
+                 FROM public.account_ips i JOIN public.accounts a ON a.account = i.account \
+                 WHERE $1::inet <<= i.cidr::cidr LIMIT 1",
+                &[&peer],
+            )
+            .await
+            .map_err(backend_err)?;
+        Ok(row.map(|row| Account {
+            id: row.get(0),
+            bandwidth_limit: row.get(1),
+            default_selection: row.get(2),
         }))
     }
 
@@ -180,21 +225,53 @@ struct StaticUser {
     password: String,
     /// Remaining byte allowance; `None` = unlimited.
     remaining: Option<AtomicI64>,
+    /// Source networks allowed to authenticate by IP.
+    allowed_nets: Vec<IpNet>,
+    default_selection: Option<String>,
 }
 
 impl StaticAuthBackend {
     /// Build from the `[[user]]` config blocks. Account ids are 1-based indices.
-    pub fn new(users: &[UserConfig]) -> Self {
+    /// Errors on a malformed `allowed_ips` entry.
+    pub fn new(users: &[UserConfig]) -> Result<Self, AuthError> {
         let users = users
             .iter()
-            .map(|u| StaticUser {
-                username: u.username.clone(),
-                password: u.password.clone(),
-                remaining: u.bandwidth_limit.map(AtomicI64::new),
+            .map(|u| {
+                let allowed_nets = u
+                    .allowed_ips
+                    .iter()
+                    .map(|s| parse_net(s))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(StaticUser {
+                    username: u.username.clone(),
+                    password: u.password.clone(),
+                    remaining: u.bandwidth_limit.map(AtomicI64::new),
+                    allowed_nets,
+                    default_selection: u.default_selection.clone(),
+                })
             })
-            .collect();
-        Self { users }
+            .collect::<Result<Vec<_>, AuthError>>()?;
+        Ok(Self { users })
     }
+
+    fn account_for(&self, index: usize, user: &StaticUser) -> Account {
+        Account {
+            id: i64::try_from(index).unwrap_or(i64::MAX) + 1,
+            bandwidth_limit: user.remaining.as_ref().map(|r| r.load(Ordering::Relaxed)),
+            default_selection: user.default_selection.clone(),
+        }
+    }
+}
+
+/// Parse an `allowed_ips` entry: a bare IP (`1.2.3.4`) becomes a host network,
+/// or a CIDR (`10.0.0.0/24`).
+fn parse_net(s: &str) -> Result<IpNet, AuthError> {
+    if let Ok(net) = IpNet::from_str(s) {
+        return Ok(net);
+    }
+    let addr = IpAddr::from_str(s)
+        .map_err(|_| AuthError::Backend(format!("invalid allowed_ips entry '{s}'")))?;
+    Ok(IpNet::from(addr))
 }
 
 /// Length-independent constant-time string comparison.
@@ -219,12 +296,16 @@ impl AuthBackend for StaticAuthBackend {
     ) -> Result<Option<Account>, AuthError> {
         for (i, u) in self.users.iter().enumerate() {
             if u.username == username && constant_time_eq(&u.password, secret) {
-                let id = i64::try_from(i).unwrap_or(i64::MAX) + 1;
-                let bandwidth_limit = u.remaining.as_ref().map(|r| r.load(Ordering::Relaxed));
-                return Ok(Some(Account {
-                    id,
-                    bandwidth_limit,
-                }));
+                return Ok(Some(self.account_for(i, u)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn authenticate_by_ip(&self, peer: IpAddr) -> Result<Option<Account>, AuthError> {
+        for (i, u) in self.users.iter().enumerate() {
+            if u.allowed_nets.iter().any(|net| net.contains(&peer)) {
+                return Ok(Some(self.account_for(i, u)));
             }
         }
         Ok(None)
@@ -254,19 +335,22 @@ impl AuthBackend for StaticAuthBackend {
 mod tests {
     use super::*;
 
+    fn user(name: &str, pw: &str, limit: Option<i64>) -> UserConfig {
+        UserConfig {
+            username: name.into(),
+            password: pw.into(),
+            bandwidth_limit: limit,
+            allowed_ips: Vec::new(),
+            default_selection: None,
+        }
+    }
+
     fn backend() -> StaticAuthBackend {
         StaticAuthBackend::new(&[
-            UserConfig {
-                username: "me".into(),
-                password: "hunter2".into(),
-                bandwidth_limit: None,
-            },
-            UserConfig {
-                username: "limited".into(),
-                password: "pw".into(),
-                bandwidth_limit: Some(1000),
-            },
+            user("me", "hunter2", None),
+            user("limited", "pw", Some(1000)),
         ])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -303,5 +387,40 @@ mod tests {
         b.report_usage(1, 9_999, 9_999).await.unwrap();
         let acct = b.authenticate("me", "hunter2").await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, None);
+    }
+
+    #[tokio::test]
+    async fn ip_auth_matches_exact_and_cidr_with_default_selection() {
+        let mut u = user("ipuser", "x", None);
+        u.allowed_ips = vec!["1.2.3.4".into(), "10.0.0.0/24".into()];
+        u.default_selection = Some("country-us".into());
+        let b = StaticAuthBackend::new(&[u]).unwrap();
+
+        // exact
+        let a = b
+            .authenticate_by_ip("1.2.3.4".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("exact ip authorised");
+        assert_eq!(a.default_selection.as_deref(), Some("country-us"));
+        // inside CIDR
+        assert!(b
+            .authenticate_by_ip("10.0.0.99".parse().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        // outside
+        assert!(b
+            .authenticate_by_ip("9.9.9.9".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn malformed_allowed_ip_is_a_startup_error() {
+        let mut u = user("bad", "x", None);
+        u.allowed_ips = vec!["not-an-ip".into()];
+        assert!(StaticAuthBackend::new(&[u]).is_err());
     }
 }

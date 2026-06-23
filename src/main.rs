@@ -19,6 +19,7 @@ mod auth;
 mod config;
 mod protocol;
 mod protocols;
+mod routing;
 mod stats;
 
 use crate::{
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             }
-            let backend = Arc::new(StaticAuthBackend::new(&config.user));
+            let backend = Arc::new(StaticAuthBackend::new(&config.user)?);
             (backend, None)
         };
 

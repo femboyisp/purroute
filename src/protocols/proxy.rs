@@ -34,6 +34,8 @@ pub enum ProxyError {
     Timeout,
     #[error("Unsupported protocol")]
     UnsupportedProtocol,
+    #[error("No upstream matches the requested location/ISP selection")]
+    NoMatchingUpstream,
 }
 
 #[derive(Clone)]
@@ -60,8 +62,31 @@ impl ProxyServer {
         }
     }
 
-    /// Resolve the chain to use for a connection
-    fn resolve_proxy_chain(&self) -> Result<Vec<ProxyConfig>, ProxyError> {
+    /// Resolve the upstream chain for a connection, honouring a routing
+    /// [`Selection`] when it constrains location/ISP/type; otherwise the global
+    /// `[router].chain`.
+    fn resolve_proxy_chain(
+        &self,
+        selection: &crate::routing::Selection,
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        if !selection.only_session() {
+            // Filter upstreams by the selection's tags, then pick (sticky/rotate).
+            let candidates: Vec<ProxyConfig> = self
+                .proxy
+                .iter()
+                .filter(|p| selection.matches(&p.tags))
+                .cloned()
+                .collect();
+            let idx = crate::routing::pick_index(candidates.len(), selection.session.as_deref())
+                .ok_or(ProxyError::NoMatchingUpstream)?;
+            return Ok(vec![candidates[idx].clone()]);
+        }
+        self.resolve_global_chain()
+    }
+
+    /// The original global resolution: a single `[[proxy]]` by label or a
+    /// `[[chain]]` by id, used when no location/ISP selection is given.
+    fn resolve_global_chain(&self) -> Result<Vec<ProxyConfig>, ProxyError> {
         // If router.chain is specified, use that chain
         if let Some(chain_ref) = &self.config.chain {
             // First, try to find a single proxy by label (Single mode)
@@ -219,7 +244,9 @@ impl ProxyServer {
                 String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen])
                     .to_string();
 
-            // Verify credentials and check bandwidth via the auth backend.
+            // Authenticate with the base username (routing tokens stripped).
+            let (username, _selection) =
+                crate::routing::parse_username(&username).map_err(|_| ProxyError::AuthFailed)?;
             let account = self
                 .auth
                 .authenticate(&username, &password)
@@ -335,7 +362,7 @@ impl ProxyServer {
         let stats = get_global_stats();
         stats.add_bytes_in(as_u64(initial_request.len()));
 
-        let user_account = self.authenticate_user(&initial_request).await?;
+        let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_socks4_target(&initial_request)?;
 
         let upstream =
@@ -367,7 +394,7 @@ impl ProxyServer {
         let stats = get_global_stats();
         stats.add_bytes_in(as_u64(initial_request.len()));
 
-        let user_account = self.authenticate_user(&initial_request).await?;
+        let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_connect_target(&initial_request)?;
 
         let upstream =
@@ -399,7 +426,7 @@ impl ProxyServer {
         let stats = get_global_stats();
         stats.add_bytes_in(as_u64(initial_request.len()));
 
-        let user_account = self.authenticate_user(&initial_request).await?;
+        let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_http_target(&initial_request)?;
 
         let mut upstream =
@@ -480,8 +507,13 @@ impl ProxyServer {
                     &server.config,
                 );
 
-                // Resolve the proxy chain to use
-                let proxy_chain = server.resolve_proxy_chain()?;
+                // Parse any location/ISP selection from the proxy username and
+                // resolve the upstream accordingly (SOCKS5 carries its username
+                // in a later handshake step, so its selection is empty here).
+                let selection = server
+                    .selection_for(&protocol, &initial_request, peer_addr)
+                    .await;
+                let proxy_chain = server.resolve_proxy_chain(&selection)?;
                 let target_proxy = &proxy_chain[0];
 
                 metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
@@ -583,7 +615,9 @@ impl ProxyServer {
                             .await
                     }
                     Proxy::Socks4 => {
-                        let user_account = server.authenticate_user(&initial_request).await?;
+                        let user_account = server
+                            .authenticate_user(&initial_request, peer_addr)
+                            .await?;
 
                         Socks4::handle(
                             client,
@@ -608,7 +642,9 @@ impl ProxyServer {
                         .await
                     }
                     Proxy::Http => {
-                        let user_account = server.authenticate_user(&initial_request).await?;
+                        let user_account = server
+                            .authenticate_user(&initial_request, peer_addr)
+                            .await?;
 
                         Http::handle(
                             client,
@@ -633,7 +669,9 @@ impl ProxyServer {
                         .await
                     }
                     Proxy::Https => {
-                        let user_account = server.authenticate_user(&initial_request).await?;
+                        let user_account = server
+                            .authenticate_user(&initial_request, peer_addr)
+                            .await?;
 
                         Https::handle(
                             client,
@@ -668,6 +706,40 @@ impl ProxyServer {
         handle
             .await
             .unwrap_or_else(|e| Err(ProxyError::Protocol(e.to_string())))
+    }
+
+    /// Determine the routing [`Selection`](crate::routing::Selection) for a
+    /// connection: from the proxy username's tokens, else from the account's
+    /// stored default (looked up by source IP for credential-less connections).
+    /// SOCKS5 sends its username in a later step, so its token-selection is empty
+    /// here (global routing).
+    async fn selection_for(
+        &self,
+        protocol: &Proxy,
+        request: &[u8],
+        peer: SocketAddr,
+    ) -> crate::routing::Selection {
+        let username = match protocol {
+            Proxy::Http | Proxy::Https => http_proxy_username(request),
+            Proxy::Socks4 => socks4_userid(request),
+            Proxy::Socks5 => None,
+        };
+        let from_tokens = username
+            .and_then(|u| crate::routing::parse_username(&u).ok())
+            .map(|(_base, sel)| sel)
+            .unwrap_or_default();
+        if !from_tokens.is_empty() {
+            return from_tokens;
+        }
+        // No tokens: fall back to the account's stored default, found by IP.
+        if let Ok(Some(account)) = self.auth.authenticate_by_ip(peer.ip()).await {
+            if let Some(def) = account.default_selection {
+                if let Ok((_base, sel)) = crate::routing::parse_username(&def) {
+                    return sel;
+                }
+            }
+        }
+        from_tokens
     }
 
     pub fn detect_protocol(&self, request: &[u8]) -> Result<Proxy, ProxyError> {
@@ -706,17 +778,29 @@ impl ProxyServer {
         }
     }
 
-    pub async fn authenticate_user(&self, request: &[u8]) -> Result<Option<i64>, ProxyError> {
+    pub async fn authenticate_user(
+        &self,
+        request: &[u8],
+        peer: SocketAddr,
+    ) -> Result<Option<i64>, ProxyError> {
         if let Some(auth) = self.config.auth {
             if auth {
                 let request_str = String::from_utf8_lossy(request);
-                let auth_header = request_str
-                    .lines()
-                    .find(|line| {
-                        line.to_lowercase()
-                            .starts_with("proxy-authorization: basic ")
-                    })
-                    .ok_or(ProxyError::AuthFailed)?;
+                let auth_header = request_str.lines().find(|line| {
+                    line.to_lowercase()
+                        .starts_with("proxy-authorization: basic ")
+                });
+                // No credentials: authorise by source IP if allowed.
+                let Some(auth_header) = auth_header else {
+                    let account = self
+                        .auth
+                        .authenticate_by_ip(peer.ip())
+                        .await
+                        .map_err(|_| ProxyError::AuthFailed)?
+                        .ok_or(ProxyError::AuthFailed)?;
+                    check_bandwidth(account.bandwidth_limit, "<ip>", &self.config)?;
+                    return Ok(Some(account.id));
+                };
 
                 let encoded_credentials = auth_header[27..].trim();
                 let decoded_credentials = base64::engine::general_purpose::STANDARD
@@ -725,19 +809,22 @@ impl ProxyServer {
                 let credentials =
                     String::from_utf8(decoded_credentials).map_err(|_| ProxyError::AuthFailed)?;
                 let mut parts = credentials.split(':');
-                let username = parts.next().ok_or(ProxyError::AuthFailed)?;
+                let raw_username = parts.next().ok_or(ProxyError::AuthFailed)?;
                 let password = parts.next().ok_or(ProxyError::AuthFailed)?;
 
-                // Auth backend: handles the nullable `bandwidth_limit` correctly
-                // (NULL ⇒ no limit).
+                // Authenticate with the *base* username; routing tokens (e.g.
+                // `-country-us`) are stripped off and used for upstream selection.
+                let (username, _selection) = crate::routing::parse_username(raw_username)
+                    .map_err(|_| ProxyError::AuthFailed)?;
+
                 let account = self
                     .auth
-                    .authenticate(username, password)
+                    .authenticate(&username, password)
                     .await
                     .map_err(|_| ProxyError::AuthFailed)?
                     .ok_or(ProxyError::AuthFailed)?;
 
-                check_bandwidth(account.bandwidth_limit, username, &self.config)?;
+                check_bandwidth(account.bandwidth_limit, &username, &self.config)?;
                 return Ok(Some(account.id));
             }
         }
@@ -949,6 +1036,29 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16), 
         }
         None => Ok((authority.to_string(), default_port)),
     }
+}
+
+/// Extract the username from an HTTP `Proxy-Authorization: Basic` header.
+fn http_proxy_username(request: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(request);
+    let line = text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("proxy-authorization: basic "))?;
+    let encoded = line[27..].trim();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let creds = String::from_utf8(decoded).ok()?;
+    creds.split(':').next().map(str::to_owned)
+}
+
+/// Extract the user-id field from a SOCKS4/4a request.
+fn socks4_userid(request: &[u8]) -> Option<String> {
+    if request.len() < 9 || request[0] != 0x04 {
+        return None;
+    }
+    let end = request[8..].iter().position(|&b| b == 0)? + 8;
+    (end > 8).then(|| String::from_utf8_lossy(&request[8..end]).into_owned())
 }
 
 /// Parse the target `host:port` from an HTTP `CONNECT` request line.
