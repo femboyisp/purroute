@@ -6,28 +6,49 @@ from the first bytes of each connection, and forwards traffic upstream through a
 single proxy or a multi-hop chain — translating between protocols as needed. It
 enforces per-user auth and bandwidth limits through a pluggable `AuthBackend`.
 
-purroute is self-contained: it has no account, billing, or payment code. A
-separate system may manage users in the same database; purroute only ever reads
-`(username, secret, bandwidth_limit)` and reports usage.
+purroute is self-contained: accounts come from a pluggable `AuthBackend`, so it
+runs **with no database at all** (users listed in `config.toml`) or against
+PostgreSQL for many users. It only ever reads `(username, secret,
+bandwidth_limit)` and reports usage.
 
 ## Features
 
 - Auto-detection of the inbound protocol — one endpoint serves every client type.
 - Protocol translation across all inbound→upstream combinations.
 - Multi-hop chaining (strict or random order) for every inbound protocol.
-- Pluggable authentication (`AuthBackend`); ships with a PostgreSQL backend.
+- Pluggable authentication (`AuthBackend`): inline users (no database) or PostgreSQL.
 - Local-only Prometheus `/metrics` endpoint.
 
-## Quick start
+## Quick start (single user, no database)
 
 ```sh
 cp config.toml.example config.toml      # main() reads "config.toml" from cwd
-docker-compose up --build               # PostgreSQL dependency
+# config.toml: a [router], one [[proxy]], and one [[user]] — no [database] needed
 cargo run --release
 ```
 
-See `config.toml.example` for the full configuration model (`[[proxy]]`,
-`[[chain]]`, `[router]`, `[database]`). `CLAUDE.md` documents the internals.
+```toml
+[router]
+listen = "127.0.0.1:1080"
+auth = true
+chain = "exit"
+
+[[user]]
+username = "me"
+password = "hunter2"
+# bandwidth_limit = 1073741824   # optional, bytes; omit for unlimited
+
+[[proxy]]
+label = "exit"
+proxy_type = "Socks5"
+address = "10.0.0.1:1080"
+```
+
+Point any proxy client at `127.0.0.1:1080` with `me:hunter2`.
+
+For many users, add a `[database]` section (and `docker-compose up --build` for a
+local PostgreSQL) instead of `[[user]]` blocks. See `config.toml.example` for the
+full model; `CLAUDE.md` documents the internals.
 
 ## Auth backend
 
@@ -38,8 +59,9 @@ async fn authenticate(&self, username: &str, secret: &str) -> Result<Option<Acco
 async fn report_usage(&self, id: i64, bytes_in: u64, bytes_out: u64) -> Result<(), AuthError>;
 ```
 
-`PostgresAuthBackend` is the default. Implement the trait against an HTTP API or
-any other store to drop the database dependency entirely.
+It ships with `StaticAuthBackend` (inline users, no database) and
+`PostgresAuthBackend`. Implement the trait against an HTTP API or any other store
+to plug in your own account source.
 
 ## License
 

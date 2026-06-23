@@ -9,16 +9,24 @@ auth = true
 # chain = "random-chain"                         # Random mode: Pick random proxy(ies) from chain
 metrics_listen = "127.0.0.1:9100"                # (Optional) Local-only Prometheus /metrics endpoint
 
-# Accounts (username/password + bandwidth_limit) live in the `accounts` table.
-# The router reads them through its AuthBackend; create/manage them however you
-# like (direct SQL, your own service, etc.).
+# --- Accounts ---------------------------------------------------------------
+# Pick ONE of the two backends below.
+#
+# (a) Single-user / no database: list users inline. Omit [database] entirely.
+[[user]]
+username = "me"
+password = "hunter2"
+# bandwidth_limit = 1073741824   # (Optional) remaining bytes; omit for unlimited
 
-[database]
-host = "localhost"
-port = 5432
-user = "purroute"
-#password = "purroute"
-dbname = "purroute"
+# (b) PostgreSQL backend (many users): uncomment [database] and remove [[user]].
+# Accounts live in the `accounts` table (username/password + bandwidth_limit);
+# manage them however you like (direct SQL, your own service, etc.).
+# [database]
+# host = "localhost"
+# port = 5432
+# user = "purroute"
+# #password = "purroute"
+# dbname = "purroute"
 
 # Individual proxy configurations (External Connections)
 [[proxy]] # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration
