@@ -245,3 +245,221 @@ impl Socks4 {
         proxy_data(client, upstream, stats).await
     }
 }
+
+#[cfg(test)]
+mod socks4_cov {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    type RelayFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>>;
+
+    /// A no-op relay: reports success without real bidirectional IO, letting us
+    /// assert the handler reached the relay stage.
+    fn noop_relay(_c: TcpStream, _u: TcpStream, _s: Arc<GlobalStats>) -> RelayFut {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn socks4_proxy(addr: SocketAddr) -> ProxyConfig {
+        ProxyConfig {
+            label: Some("u".into()),
+            proxy_type: Proxy::Socks4,
+            address: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: None,
+            password: None,
+            tags: Default::default(),
+        }
+    }
+
+    /// Fake SOCKS4 upstream: read the forwarded request and reply with the given
+    /// CD code. Echoes back the captured target IP/domain via a oneshot.
+    async fn fake_socks4_upstream(cd: u8) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut head = [0u8; 8];
+                if s.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let mut b = [0u8; 1];
+                // consume userid until null
+                loop {
+                    if s.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    if b[0] == 0 {
+                        break;
+                    }
+                }
+                // socks4a domain when IP is 0.0.0.x (x != 0)
+                if head[4] == 0 && head[5] == 0 && head[6] == 0 && head[7] != 0 {
+                    loop {
+                        if s.read_exact(&mut b).await.is_err() {
+                            return;
+                        }
+                        if b[0] == 0 {
+                            break;
+                        }
+                    }
+                }
+                let _ = s.write_all(&[0x00, cd, 0, 0, 0, 0, 0, 0]).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    /// A client TcpStream connected to a throwaway loopback acceptor — gives the
+    /// handler a real socket to write the SOCKS4 reply into.
+    async fn fake_client() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                let _ = s.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        TcpStream::connect(addr).await.unwrap()
+    }
+
+    /// CONNECT request, IPv4 target.
+    fn req_ipv4() -> Vec<u8> {
+        vec![0x04, 0x01, 0x00, 0x50, 127, 0, 0, 1, 0]
+    }
+
+    /// SOCKS4a CONNECT request with a domain target.
+    fn req_socks4a(domain: &str) -> Vec<u8> {
+        let mut r = vec![0x04, 0x01, 0x00, 0x50, 0, 0, 0, 1, 0];
+        r.extend_from_slice(domain.as_bytes());
+        r.push(0);
+        r
+    }
+
+    #[tokio::test]
+    async fn granted_ipv4_reaches_relay() {
+        let up = fake_socks4_upstream(0x5A).await;
+        let proxy = socks4_proxy(up);
+        let client = fake_client().await;
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", up.ip(), up.port()),
+            req_ipv4(),
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(r.is_ok(), "granted IPv4 should reach relay: {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn granted_socks4a_domain_reaches_relay() {
+        let up = fake_socks4_upstream(0x5A).await;
+        let proxy = socks4_proxy(up);
+        let client = fake_client().await;
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", up.ip(), up.port()),
+            req_socks4a("example.com"),
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(r.is_ok(), "granted SOCKS4a should reach relay: {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn upstream_rejects_returns_error() {
+        // CD != 0x5A means the upstream rejected the request.
+        let up = fake_socks4_upstream(0x5B).await;
+        let proxy = socks4_proxy(up);
+        let client = fake_client().await;
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", up.ip(), up.port()),
+            req_ipv4(),
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn invalid_version_rejected() {
+        let up = fake_socks4_upstream(0x5A).await;
+        let proxy = socks4_proxy(up);
+        let client = fake_client().await;
+        let mut req = req_ipv4();
+        req[0] = 0x05; // not SOCKS4
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", up.ip(), up.port()),
+            req,
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("version")));
+    }
+
+    #[tokio::test]
+    async fn non_connect_command_rejected() {
+        let up = fake_socks4_upstream(0x5A).await;
+        let proxy = socks4_proxy(up);
+        let client = fake_client().await;
+        let mut req = req_ipv4();
+        req[1] = 0x02; // BIND, unsupported
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", up.ip(), up.port()),
+            req,
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("CONNECT")));
+    }
+
+    #[tokio::test]
+    async fn socks4a_missing_domain_rejected() {
+        let up = fake_socks4_upstream(0x5A).await;
+        let proxy = socks4_proxy(up);
+        let client = fake_client().await;
+        // SOCKS4a marker IP but the domain field is empty (just the trailing 0).
+        let req = vec![0x04, 0x01, 0x00, 0x50, 0, 0, 0, 1, 0, 0];
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", up.ip(), up.port()),
+            req,
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("domain")));
+    }
+
+    #[tokio::test]
+    async fn upstream_connect_failure_returns_error() {
+        // Bind then drop the listener so the port is (almost certainly) closed.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = listener.local_addr().unwrap();
+        drop(listener);
+        let proxy = socks4_proxy(dead);
+        let client = fake_client().await;
+        let r = Socks4::handle(
+            client,
+            &format!("{}:{}", dead.ip(), dead.port()),
+            req_ipv4(),
+            &proxy,
+            noop_relay,
+        )
+        .await;
+        assert!(r.is_err(), "connecting to a dead upstream should fail");
+    }
+}

@@ -228,3 +228,327 @@ impl Http {
         proxy_data(client, upstream, stats).await
     }
 }
+
+#[cfg(test)]
+mod http_cov {
+    //! Hermetic in-process tests for [`Http::handle`]. Each test stands up a
+    //! fake upstream on loopback, drives `Http::handle` directly with a no-op
+    //! `proxy_data` closure, and asserts on the branch behaviour — no network,
+    //! no containers, no real relay.
+    use super::*;
+    use crate::config::Tags;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    type RelayFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>>;
+
+    /// A `proxy_data` closure that does nothing and reports success. Lets us
+    /// exercise the handshake/forwarding logic without a real relay.
+    fn noop_proxy_data() -> impl Fn(TcpStream, TcpStream, Arc<GlobalStats>) -> RelayFut {
+        |_c, _u, _s| Box::pin(async { Ok(()) })
+    }
+
+    fn proxy(kind: Proxy, addr: SocketAddrLike) -> ProxyConfig {
+        ProxyConfig {
+            label: Some("t".into()),
+            proxy_type: kind,
+            address: addr.ip.clone(),
+            port: Some(addr.port),
+            username: None,
+            password: None,
+            tags: Tags::default(),
+        }
+    }
+
+    struct SocketAddrLike {
+        ip: String,
+        port: u16,
+    }
+
+    use std::net::SocketAddr;
+    fn split(a: SocketAddr) -> SocketAddrLike {
+        SocketAddrLike {
+            ip: a.ip().to_string(),
+            port: a.port(),
+        }
+    }
+
+    /// Connect a fresh loopback client TcpStream to `addr`, returning the
+    /// client end the handler will use.
+    async fn client_to(addr: SocketAddr) -> TcpStream {
+        TcpStream::connect(addr).await.unwrap()
+    }
+
+    /// Fake HTTP upstream: accept one conn, capture the forwarded bytes,
+    /// reply 200. Returns (addr, oneshot receiver of captured request bytes).
+    async fn fake_http_upstream() -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                buf.truncate(n);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+                let _ = s.flush().await;
+                let _ = tx.send(buf);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// Fake SOCKS4 upstream that grants the CONNECT then replies as origin.
+    async fn fake_socks4_grant() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut head = [0u8; 8];
+                if s.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let mut b = [0u8; 1];
+                while s.read_exact(&mut b).await.is_ok() && b[0] != 0 {}
+                // socks4a: consume domain until null
+                while s.read_exact(&mut b).await.is_ok() && b[0] != 0 {}
+                let _ = s.write_all(&[0x00, 0x5A, 0, 0, 0, 0, 0, 0]).await;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    /// Fake SOCKS4 upstream that rejects the CONNECT (CD != 0x5A).
+    async fn fake_socks4_reject() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut head = [0u8; 8];
+                let _ = s.read_exact(&mut head).await;
+                let mut b = [0u8; 1];
+                while s.read_exact(&mut b).await.is_ok() && b[0] != 0 {}
+                while s.read_exact(&mut b).await.is_ok() && b[0] != 0 {}
+                let _ = s.write_all(&[0x00, 0x5B, 0, 0, 0, 0, 0, 0]).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    /// A bound-but-never-accepting listener whose addr can be connected to,
+    /// plus a closed addr that refuses connections.
+    async fn closed_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // port now free -> connect refused
+        addr
+    }
+
+    fn req(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn http_upstream_injects_proxy_authorization() {
+        let (up, rx) = fake_http_upstream().await;
+        let mut cfg = proxy(Proxy::Http, split(up));
+        cfg.username = Some("alice".into());
+        cfg.password = Some("s3cret".into());
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok());
+        let got = rx.await.unwrap();
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("Proxy-Authorization: Basic "));
+        assert!(text.contains("Host: x"));
+    }
+
+    #[tokio::test]
+    async fn http_upstream_no_auth_when_creds_absent() {
+        let (up, rx) = fake_http_upstream().await;
+        let cfg = proxy(Proxy::Http, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok());
+        let text = String::from_utf8_lossy(&rx.await.unwrap()).to_string();
+        assert!(!text.contains("Proxy-Authorization"));
+    }
+
+    #[tokio::test]
+    async fn https_upstream_forwards_request() {
+        let (up, rx) = fake_http_upstream().await;
+        let cfg = proxy(Proxy::Https, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT x:443 HTTP/1.1\r\nHost: x:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok());
+        let text = String::from_utf8_lossy(&rx.await.unwrap()).to_string();
+        assert!(text.starts_with("CONNECT x:443"));
+    }
+
+    #[tokio::test]
+    async fn empty_request_is_protocol_error() {
+        let (up, _rx) = fake_http_upstream().await;
+        let cfg = proxy(Proxy::Http, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(client, &upstream_addr, Vec::new(), &cfg, noop_proxy_data()).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn upstream_connect_failure_is_io_error() {
+        let dead = closed_addr().await;
+        let cfg = proxy(Proxy::Http, split(dead));
+        let upstream_addr = format!("{}:{}", dead.ip(), dead.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn socks4_missing_host_header_is_protocol_error() {
+        let up = fake_socks4_grant().await;
+        let cfg = proxy(Proxy::Socks4, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        // No Host header present.
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET / HTTP/1.1\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn socks4_plain_http_forwards_request() {
+        let up = fake_socks4_grant().await;
+        let cfg = proxy(Proxy::Socks4, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn socks4_connect_sends_established() {
+        let up = fake_socks4_grant().await;
+        let cfg = proxy(Proxy::Socks4, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn socks4_rejected_connect_is_protocol_error() {
+        let up = fake_socks4_reject().await;
+        let cfg = proxy(Proxy::Socks4, split(up));
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let (peer, _h) = throwaway_peer().await;
+        let client = client_to(peer).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    /// A listener that accepts connections and drains them; its addr is a
+    /// usable peer for the "client" side of `Http::handle` (it only needs to
+    /// be writable for the CONNECT 200 reply path).
+    async fn throwaway_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, h)
+    }
+}
