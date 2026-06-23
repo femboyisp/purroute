@@ -1,19 +1,26 @@
 //! Authentication + usage-reporting backend for the router.
 //!
 //! The router does not care *how* a user came to exist or how their traffic
-//! allowance was paid for — only whether a `(username, secret)` is valid and how
+//! allowance is managed — only whether a `(username, secret)` is valid and how
 //! many bytes they have left. That contract is the [`AuthBackend`] trait.
 //!
-//! The default [`PostgresAuthBackend`] reads a generic `accounts` table and
-//! writes usage to `user_stats`. A private backend can own a *superset* of this
-//! schema (payments, subaddresses, …); the router only ever touches the columns
-//! defined here. A future `HttpAuthBackend` could implement the same trait
-//! against a remote API and drop the database dependency entirely.
+//! Two implementations ship with the router:
+//! - [`StaticAuthBackend`] — users defined inline in `config.toml` (`[[user]]`),
+//!   for single-user / no-database operation.
+//! - [`PostgresAuthBackend`] — an `accounts` table in PostgreSQL, with usage
+//!   written to `user_stats`. An optional external system may extend the same
+//!   schema; the router only ever touches the columns it defines here.
+//!
+//! Implement the trait yourself (e.g. against a remote API) to plug in any other
+//! account source.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_postgres::Client;
+
+use crate::config::UserConfig;
 
 /// A validated account: its id and remaining byte allowance (`None` = no limit).
 #[derive(Debug, Clone, Copy)]
@@ -56,8 +63,8 @@ impl PostgresAuthBackend {
     /// Create the minimal schema the router needs, if absent. Idempotent.
     ///
     /// Only `accounts(username, password, bandwidth_limit)` + `user_stats` (and
-    /// an operational `global` counters row) — no business columns. A private
-    /// backend layers its own columns/tables on top of the same database.
+    /// an operational `global` counters row). An optional external system may add
+    /// its own columns/tables to the same database; the router ignores them.
     pub async fn initialize_schema(client: &Client) -> Result<(), tokio_postgres::Error> {
         client
             .batch_execute(
@@ -158,5 +165,143 @@ impl AuthBackend for PostgresAuthBackend {
             .await
             .map_err(backend_err)?;
         Ok(())
+    }
+}
+
+/// An [`AuthBackend`] backed by users listed inline in `config.toml`
+/// (`[[user]]`). No database — usage is tracked in memory. This is what makes
+/// purroute usable as a personal, single-user proxy with zero infrastructure.
+pub struct StaticAuthBackend {
+    users: Vec<StaticUser>,
+}
+
+struct StaticUser {
+    username: String,
+    password: String,
+    /// Remaining byte allowance; `None` = unlimited.
+    remaining: Option<AtomicI64>,
+}
+
+impl StaticAuthBackend {
+    /// Build from the `[[user]]` config blocks. Account ids are 1-based indices.
+    pub fn new(users: &[UserConfig]) -> Self {
+        let users = users
+            .iter()
+            .map(|u| StaticUser {
+                username: u.username.clone(),
+                password: u.password.clone(),
+                remaining: u.bandwidth_limit.map(AtomicI64::new),
+            })
+            .collect();
+        Self { users }
+    }
+}
+
+/// Length-independent constant-time string comparison.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[async_trait]
+impl AuthBackend for StaticAuthBackend {
+    async fn authenticate(
+        &self,
+        username: &str,
+        secret: &str,
+    ) -> Result<Option<Account>, AuthError> {
+        for (i, u) in self.users.iter().enumerate() {
+            if u.username == username && constant_time_eq(&u.password, secret) {
+                let id = i64::try_from(i).unwrap_or(i64::MAX) + 1;
+                let bandwidth_limit = u.remaining.as_ref().map(|r| r.load(Ordering::Relaxed));
+                return Ok(Some(Account {
+                    id,
+                    bandwidth_limit,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn report_usage(&self, id: i64, bytes_in: u64, bytes_out: u64) -> Result<(), AuthError> {
+        let idx = usize::try_from(id - 1).ok();
+        if let Some(user) = idx.and_then(|i| self.users.get(i)) {
+            if let Some(rem) = &user.remaining {
+                let total = to_i64(bytes_in) + to_i64(bytes_out);
+                let mut cur = rem.load(Ordering::Relaxed);
+                loop {
+                    let next = (cur - total).max(0);
+                    match rem.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+                    {
+                        Ok(_) => break,
+                        Err(observed) => cur = observed,
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend() -> StaticAuthBackend {
+        StaticAuthBackend::new(&[
+            UserConfig {
+                username: "me".into(),
+                password: "hunter2".into(),
+                bandwidth_limit: None,
+            },
+            UserConfig {
+                username: "limited".into(),
+                password: "pw".into(),
+                bandwidth_limit: Some(1000),
+            },
+        ])
+    }
+
+    #[tokio::test]
+    async fn authenticates_known_user_unlimited() {
+        let acct = backend().authenticate("me", "hunter2").await.unwrap();
+        let acct = acct.expect("should authenticate");
+        assert_eq!(acct.id, 1);
+        assert_eq!(acct.bandwidth_limit, None);
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_password_and_unknown_user() {
+        let b = backend();
+        assert!(b.authenticate("me", "wrong").await.unwrap().is_none());
+        assert!(b.authenticate("ghost", "x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn report_usage_decrements_limit_and_floors_at_zero() {
+        let b = backend();
+        // user 2 starts at 1000
+        b.report_usage(2, 300, 200).await.unwrap();
+        let acct = b.authenticate("limited", "pw").await.unwrap().unwrap();
+        assert_eq!(acct.bandwidth_limit, Some(500));
+        // overshoot floors at 0
+        b.report_usage(2, 10_000, 0).await.unwrap();
+        let acct = b.authenticate("limited", "pw").await.unwrap().unwrap();
+        assert_eq!(acct.bandwidth_limit, Some(0));
+    }
+
+    #[tokio::test]
+    async fn unlimited_user_usage_is_noop() {
+        let b = backend();
+        b.report_usage(1, 9_999, 9_999).await.unwrap();
+        let acct = b.authenticate("me", "hunter2").await.unwrap().unwrap();
+        assert_eq!(acct.bandwidth_limit, None);
     }
 }

@@ -42,11 +42,17 @@ pub struct StatsDisplay {
     update_interval: Duration,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
     log_rx: broadcast::Receiver<(String, LogLevel)>,
-    db_client: Arc<Client>,
+    /// PostgreSQL client for periodic stat flushes. `None` in database-less
+    /// (single-user) mode, in which case stats stay in memory.
+    db_client: Option<Arc<Client>>,
 }
 
 impl StatsDisplay {
-    pub fn new(stats: Arc<GlobalStats>, update_interval: Duration, db_client: Arc<Client>) -> Self {
+    pub fn new(
+        stats: Arc<GlobalStats>,
+        update_interval: Duration,
+        db_client: Option<Arc<Client>>,
+    ) -> Self {
         Self {
             stats: stats.clone(),
             update_interval,
@@ -315,6 +321,10 @@ impl StatsDisplay {
     }
 
     async fn record_stats_in_db(&self, stats: &GlobalStatsSnapshot) -> Result<()> {
+        // No database in single-user mode — stats simply stay in memory.
+        let Some(db_client) = &self.db_client else {
+            return Ok(());
+        };
         let query = "
             UPDATE public.global
             SET
@@ -331,7 +341,7 @@ impl StatsDisplay {
         let bytes_in = stats.total_bytes_in;
         let bytes_out = stats.total_bytes_out;
 
-        self.db_client
+        db_client
             .execute(
                 query,
                 &[&total_conn, &succ_conn, &fail_conn, &bytes_in, &bytes_out],

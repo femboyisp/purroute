@@ -1,8 +1,8 @@
 //! TOML configuration types for the router.
 //!
-//! purroute is self-contained: it parses its own config and knows nothing about
-//! payments, reseller accounts, or pricing. A separate (private) backend may
-//! extend the same database, but the router only ever reads what it needs.
+//! purroute is self-contained: it parses its own config and reads only what it
+//! needs. Unknown sections are ignored, so an optional external system may share
+//! the same file/database without the router caring.
 
 use std::fs;
 use std::path::Path;
@@ -13,14 +13,27 @@ use serde::Deserialize;
 
 use crate::protocol::Protocol;
 
-/// Top-level `config.toml` shape. Unknown sections (e.g. a backend's
-/// `[payments]`) are ignored, so the router and backend can share one file.
+/// Top-level `config.toml` shape. Unknown sections are ignored.
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub router: RouterConfig,
     pub proxy: Vec<ProxyConfig>,
     pub chain: Option<Vec<ChainConfig>>,
+    /// Optional PostgreSQL backend. When present, accounts live in the database.
     pub database: Option<DatabaseConfig>,
+    /// Inline users for single-user / no-database operation. Used only when
+    /// `[database]` is absent.
+    #[serde(default)]
+    pub user: Vec<UserConfig>,
+}
+
+/// An inline user for database-less operation (`[[user]]` blocks).
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserConfig {
+    pub username: String,
+    pub password: String,
+    /// Remaining traffic allowance in bytes. Omit for unlimited.
+    pub bandwidth_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,21 +115,6 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 }
 
-/// The router config, upstream proxies, optional chains, and optional database
-/// config, as returned by [`load_config`].
-pub type LoadedConfig = (
-    RouterConfig,
-    Vec<ProxyConfig>,
-    Option<Vec<ChainConfig>>,
-    Option<DatabaseConfig>,
-);
-
-/// Tuple loader used by `main`.
-pub fn load_config(path: &str) -> Result<LoadedConfig, ConfigError> {
-    let config = Config::load(path)?;
-    Ok((config.router, config.proxy, config.chain, config.database))
-}
-
 /// Base64 `username:password` for HTTP Basic `Proxy-Authorization`.
 pub fn encode_auth(username: &str, password: &str) -> String {
     STANDARD.encode(format!("{username}:{password}"))
@@ -154,7 +152,7 @@ mod tests {
 
     #[test]
     fn ignores_unknown_sections() {
-        // A backend's [payments] block must not break the router's parse.
+        // An unrelated [extra] block must not break the router's parse.
         let toml = r#"
             [router]
             listen = "127.0.0.1:1080"
@@ -164,12 +162,41 @@ mod tests {
             proxy_type = "Http"
             address = "10.0.0.1"
 
-            [payments]
-            wallet_rpc_url = "http://localhost:18083"
-            price_xmr_per_gb = 0.0005
+            [extra]
+            anything = "ignored"
+            number = 42
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.proxy[0].proxy_type, Protocol::Http);
+    }
+
+    #[test]
+    fn parses_inline_users() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            auth = true
+
+            [[proxy]]
+            label = "us"
+            proxy_type = "Socks5"
+            address = "10.0.0.1:1080"
+
+            [[user]]
+            username = "me"
+            password = "hunter2"
+
+            [[user]]
+            username = "limited"
+            password = "pw"
+            bandwidth_limit = 1000
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.database.is_none());
+        assert_eq!(config.user.len(), 2);
+        assert_eq!(config.user[0].username, "me");
+        assert_eq!(config.user[0].bandwidth_limit, None);
+        assert_eq!(config.user[1].bandwidth_limit, Some(1000));
     }
 
     #[test]
