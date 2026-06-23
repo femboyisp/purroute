@@ -463,3 +463,328 @@ mod socks4_cov {
         assert!(r.is_err(), "connecting to a dead upstream should fail");
     }
 }
+
+#[cfg(test)]
+mod socks4_cov2 {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    type RelayFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>>;
+
+    fn noop_relay(_c: TcpStream, _u: TcpStream, _s: Arc<GlobalStats>) -> RelayFut {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Real bidirectional relay: copies client->upstream and upstream->client to
+    /// completion. Exercises the proxy_data success path with real bytes.
+    fn real_relay(c: TcpStream, u: TcpStream, _s: Arc<GlobalStats>) -> RelayFut {
+        Box::pin(async move {
+            let mut c = c;
+            let mut u = u;
+            let (mut cr, mut cw) = c.split();
+            let (mut ur, mut uw) = u.split();
+            let c2u = async {
+                let _ = tokio::io::copy(&mut cr, &mut uw).await;
+                let _ = uw.shutdown().await;
+            };
+            let u2c = async {
+                let _ = tokio::io::copy(&mut ur, &mut cw).await;
+                let _ = cw.shutdown().await;
+            };
+            tokio::join!(c2u, u2c);
+            Ok(())
+        })
+    }
+
+    fn proxy_of(
+        addr: SocketAddr,
+        ty: Proxy,
+        user: Option<&str>,
+        pass: Option<&str>,
+    ) -> ProxyConfig {
+        ProxyConfig {
+            label: Some("u".into()),
+            proxy_type: ty,
+            address: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: user.map(str::to_string),
+            password: pass.map(str::to_string),
+            tags: Default::default(),
+        }
+    }
+
+    fn addr_str(a: SocketAddr) -> String {
+        format!("{}:{}", a.ip(), a.port())
+    }
+
+    /// A client socket whose peer reads `read_back` bytes the handler writes, then
+    /// sends `to_send` so the relay copies real bytes back to the handler's client.
+    async fn fake_client_with(
+        to_send: &'static [u8],
+        capture: bool,
+    ) -> (TcpStream, std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>) {
+        let buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let buf2 = buf.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                // read the SOCKS4 reply (8 bytes) plus any relayed payload
+                if capture {
+                    let mut tmp = vec![0u8; 1024];
+                    if let Ok(n) = s.read(&mut tmp).await {
+                        buf2.lock().await.extend_from_slice(&tmp[..n]);
+                    }
+                }
+                if !to_send.is_empty() {
+                    let _ = s.write_all(to_send).await;
+                }
+                let _ = s.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        (TcpStream::connect(addr).await.unwrap(), buf)
+    }
+
+    async fn plain_client() -> TcpStream {
+        fake_client_with(b"", false).await.0
+    }
+
+    fn req_ipv4() -> Vec<u8> {
+        vec![0x04, 0x01, 0x00, 0x50, 127, 0, 0, 1, 0]
+    }
+
+    // ---- HTTP CONNECT upstream paths ----
+
+    /// Fake HTTP CONNECT proxy. Replies with `resp`, then (if granted) echoes
+    /// any tunneled bytes back so a real relay sees data.
+    async fn fake_http_proxy(resp: &'static [u8], echo: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await; // the CONNECT request
+                let _ = s.write_all(resp).await;
+                let _ = s.flush().await;
+                if echo {
+                    let mut data = [0u8; 256];
+                    if let Ok(n) = s.read(&mut data).await {
+                        let _ = s.write_all(&data[..n]).await;
+                        let _ = s.flush().await;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn http_connect_granted_no_auth() {
+        let up = fake_http_proxy(b"HTTP/1.1 200 Connection Established\r\n\r\n", false).await;
+        let proxy = proxy_of(up, Proxy::Http, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(r.is_ok(), "{:?}", r);
+    }
+
+    #[tokio::test]
+    async fn https_connect_granted_with_auth() {
+        let up = fake_http_proxy(b"HTTP/1.1 200 Connection Established\r\n\r\n", false).await;
+        let proxy = proxy_of(up, Proxy::Https, Some("user"), Some("pw"));
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(r.is_ok(), "{:?}", r);
+    }
+
+    #[tokio::test]
+    async fn http_connect_failure_response() {
+        let up = fake_http_proxy(b"HTTP/1.1 403 Forbidden\r\n\r\n", false).await;
+        let proxy = proxy_of(up, Proxy::Http, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("HTTP tunnel failed")));
+    }
+
+    #[tokio::test]
+    async fn http_connect_real_relay_moves_bytes() {
+        let up = fake_http_proxy(b"HTTP/1.1 200 Connection Established\r\n\r\n", true).await;
+        let proxy = proxy_of(up, Proxy::Http, None, None);
+        // client peer first reads the 8-byte SOCKS reply, then sends payload that
+        // gets echoed by the upstream back through the relay.
+        let (client, _buf) = fake_client_with(b"ping-bytes", true).await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, real_relay).await;
+        assert!(r.is_ok(), "{:?}", r);
+    }
+
+    // ---- SOCKS5 upstream paths ----
+
+    /// Fake SOCKS5 upstream. `method` is the byte returned in the method-selection
+    /// reply; `auth_ok`/`connect_cd` drive the auth and connect replies.
+    async fn fake_socks5_proxy(
+        method: u8,
+        auth_status: u8,
+        connect_rep: u8,
+        atyp: u8,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                // read method-selection handshake (variable len): ver, nmethods, methods
+                let mut h = [0u8; 2];
+                if s.read_exact(&mut h).await.is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; h[1] as usize];
+                let _ = s.read_exact(&mut methods).await;
+                let _ = s.write_all(&[0x05, method]).await;
+                let _ = s.flush().await;
+                if method == 0x02 {
+                    // read username/password auth: ver, ulen, user, plen, pass
+                    let mut a = [0u8; 2];
+                    if s.read_exact(&mut a).await.is_err() {
+                        return;
+                    }
+                    let mut user = vec![0u8; a[1] as usize];
+                    let _ = s.read_exact(&mut user).await;
+                    let mut pl = [0u8; 1];
+                    let _ = s.read_exact(&mut pl).await;
+                    let mut pass = vec![0u8; pl[0] as usize];
+                    let _ = s.read_exact(&mut pass).await;
+                    let _ = s.write_all(&[0x01, auth_status]).await;
+                    let _ = s.flush().await;
+                    if auth_status != 0x00 {
+                        return;
+                    }
+                }
+                // read connect request: ver,cmd,rsv,atyp,len,host,port
+                let mut c = [0u8; 4];
+                if s.read_exact(&mut c).await.is_err() {
+                    return;
+                }
+                let mut hl = [0u8; 1];
+                let _ = s.read_exact(&mut hl).await;
+                let mut host = vec![0u8; hl[0] as usize + 2];
+                let _ = s.read_exact(&mut host).await;
+                // build reply with requested atyp
+                let mut reply = vec![0x05, connect_rep, 0x00, atyp];
+                match atyp {
+                    0x01 => reply.extend_from_slice(&[0, 0, 0, 0, 0, 0]),
+                    0x03 => {
+                        reply.push(3);
+                        reply.extend_from_slice(b"xyz");
+                        reply.extend_from_slice(&[0, 0]);
+                    }
+                    0x04 => reply.extend_from_slice(&[0u8; 18]),
+                    _ => {}
+                }
+                let _ = s.write_all(&reply).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn socks5_no_auth_granted_ipv4_reply() {
+        let up = fake_socks5_proxy(0x00, 0x00, 0x00, 0x01).await;
+        let proxy = proxy_of(up, Proxy::Socks5, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(r.is_ok(), "{:?}", r);
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_granted_domain_reply() {
+        let up = fake_socks5_proxy(0x02, 0x00, 0x00, 0x03).await;
+        let proxy = proxy_of(up, Proxy::Socks5, Some("user"), Some("pw"));
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(r.is_ok(), "{:?}", r);
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_granted_ipv6_reply() {
+        let up = fake_socks5_proxy(0x02, 0x00, 0x00, 0x04).await;
+        let proxy = proxy_of(up, Proxy::Socks5, Some("user"), Some("pw"));
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(r.is_ok(), "{:?}", r);
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_required_but_no_creds() {
+        // Upstream selects 0x02 (user/pass) but proxy config has no creds.
+        let up = fake_socks5_proxy(0x02, 0x00, 0x00, 0x01).await;
+        let proxy = proxy_of(up, Proxy::Socks5, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("required")));
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_failed() {
+        let up = fake_socks5_proxy(0x02, 0x01, 0x00, 0x01).await;
+        let proxy = proxy_of(up, Proxy::Socks5, Some("user"), Some("pw"));
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("authentication failed")));
+    }
+
+    #[tokio::test]
+    async fn socks5_handshake_method_rejected() {
+        // 0xFF = no acceptable methods.
+        let up = fake_socks5_proxy(0xFF, 0x00, 0x00, 0x01).await;
+        let proxy = proxy_of(up, Proxy::Socks5, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("handshake failed")));
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_rep_failure() {
+        let up = fake_socks5_proxy(0x00, 0x00, 0x01, 0x01).await;
+        let proxy = proxy_of(up, Proxy::Socks5, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("Connection failed")));
+    }
+
+    #[tokio::test]
+    async fn socks5_invalid_atyp() {
+        let up = fake_socks5_proxy(0x00, 0x00, 0x00, 0x09).await;
+        let proxy = proxy_of(up, Proxy::Socks5, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(m)) if m.contains("address type")));
+    }
+
+    // ---- read failure: upstream closes after handshake ----
+
+    /// Fake SOCKS4 upstream that accepts then immediately closes, causing the
+    /// handler's read_exact of the 8-byte reply to fail.
+    async fn fake_socks4_closes() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn socks4_upstream_closes_read_fails() {
+        let up = fake_socks4_closes().await;
+        let proxy = proxy_of(up, Proxy::Socks4, None, None);
+        let client = plain_client().await;
+        let r = Socks4::handle(client, &addr_str(up), req_ipv4(), &proxy, noop_relay).await;
+        assert!(r.is_err());
+    }
+}

@@ -1683,3 +1683,494 @@ mod loopback {
         assert!(read_body(&mut c).await.contains(BODY));
     }
 }
+
+#[cfg(test)]
+mod proxy_cov2 {
+    //! Coverage for multi-hop chain handlers over non-SOCKS5 inbound, IP-based
+    //! auth/default-selection, bandwidth refusal, and protocol-detection /
+    //! malformed-greeting error paths. Hermetic: loopback only, no sleeps >100ms.
+    use super::*;
+    use crate::auth::StaticAuthBackend;
+    use crate::config::{ChainConfig, ChainMode, Tags, UserConfig};
+    use std::time::Duration;
+
+    const BODY2: &str = "Cov2OK";
+
+    fn px(label: &str, kind: Proxy, addr: SocketAddr) -> ProxyConfig {
+        ProxyConfig {
+            label: Some(label.to_owned()),
+            proxy_type: kind,
+            address: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: None,
+            password: None,
+            tags: Tags::default(),
+        }
+    }
+
+    fn usr(name: &str, pass: &str) -> UserConfig {
+        UserConfig {
+            username: name.to_owned(),
+            password: pass.to_owned(),
+            bandwidth_limit: None,
+            allowed_ips: Vec::new(),
+            default_selection: None,
+        }
+    }
+
+    fn rcfg(chain: Option<&str>, auth: bool) -> Arc<RouterConfig> {
+        Arc::new(RouterConfig {
+            listen: "127.0.0.1:0".into(),
+            chain: chain.map(str::to_owned),
+            log: Some(false),
+            verbose: Some(false),
+            debug: Some(false),
+            auth: Some(auth),
+            metrics_listen: None,
+        })
+    }
+
+    fn mk(
+        proxies: Vec<ProxyConfig>,
+        chains: Option<Vec<ChainConfig>>,
+        chain: Option<&str>,
+        users: Vec<UserConfig>,
+        auth: bool,
+    ) -> ProxyServer {
+        let backend = Arc::new(StaticAuthBackend::new(&users).unwrap());
+        let display = Arc::new(StatsDisplay::new(
+            get_global_stats(),
+            Duration::from_secs(60),
+            None,
+        ));
+        ProxyServer::new(proxies, chains, display, rcfg(chain, auth), backend)
+    }
+
+    async fn serve1(srv: ProxyServer) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, peer)) = listener.accept().await {
+                let _ = srv.handle_connection(stream, peer, None).await;
+            }
+        });
+        addr
+    }
+
+    async fn s5_greeting(s: &mut TcpStream) {
+        let mut g = [0u8; 2];
+        s.read_exact(&mut g).await.unwrap();
+        let mut m = vec![0u8; g[1] as usize];
+        s.read_exact(&mut m).await.unwrap();
+    }
+
+    async fn s5_connect(s: &mut TcpStream) -> (String, u16) {
+        let mut h = [0u8; 4];
+        s.read_exact(&mut h).await.unwrap();
+        let host = match h[3] {
+            0x01 => {
+                let mut a = [0u8; 4];
+                s.read_exact(&mut a).await.unwrap();
+                format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+            }
+            0x03 => {
+                let mut l = [0u8; 1];
+                s.read_exact(&mut l).await.unwrap();
+                let mut d = vec![0u8; l[0] as usize];
+                s.read_exact(&mut d).await.unwrap();
+                String::from_utf8_lossy(&d).into_owned()
+            }
+            _ => panic!("atyp"),
+        };
+        let mut p = [0u8; 2];
+        s.read_exact(&mut p).await.unwrap();
+        (host, u16::from_be_bytes(p))
+    }
+
+    /// Intermediate SOCKS5 hop: dial onward and splice.
+    async fn s5_hop() -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                s5_greeting(&mut s).await;
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let (host, port) = s5_connect(&mut s).await;
+                let up = TcpStream::connect((host.as_str(), port)).await.unwrap();
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let (mut cr, mut cw) = s.into_split();
+                let (mut ur, mut uw) = up.into_split();
+                let a = tokio::spawn(async move { tokio::io::copy(&mut cr, &mut uw).await });
+                let b = tokio::spawn(async move { tokio::io::copy(&mut ur, &mut cw).await });
+                let _ = a.await;
+                let _ = b.await;
+            }
+        });
+        addr
+    }
+
+    /// Origin SOCKS5 proxy that answers the tunnelled HTTP request with BODY2.
+    async fn s5_origin() -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                s5_greeting(&mut s).await;
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let _ = s5_connect(&mut s).await;
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY2.len(),
+                    BODY2
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        addr
+    }
+
+    async fn drain(s: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(2), s.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(BODY2.len()).any(|w| w == BODY2.as_bytes()) {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn two_hop_chain(hop: SocketAddr, origin: SocketAddr) -> (Vec<ProxyConfig>, Vec<ChainConfig>) {
+        let proxies = vec![
+            px("h1", Proxy::Socks5, hop),
+            px("h2", Proxy::Socks5, origin),
+        ];
+        let chains = vec![ChainConfig {
+            chain_id: "dbl".into(),
+            proxies: vec!["h1".into(), "h2".into()],
+            mode: ChainMode::Strict,
+            count: None,
+        }];
+        (proxies, chains)
+    }
+
+    // ---- (1) MULTI-HOP for non-SOCKS5 inbound ---------------------------
+
+    #[tokio::test]
+    async fn http_inbound_multi_hop_chain() {
+        let origin = s5_origin().await;
+        let hop = s5_hop().await;
+        let (proxies, chains) = two_hop_chain(hop, origin);
+        let srv = mk(proxies, Some(chains), Some("dbl"), vec![], false);
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(drain(&mut c).await.contains(BODY2));
+    }
+
+    #[tokio::test]
+    async fn https_connect_inbound_multi_hop_chain() {
+        let origin = s5_origin().await;
+        let hop = s5_hop().await;
+        let (proxies, chains) = two_hop_chain(hop, origin);
+        let srv = mk(proxies, Some(chains), Some("dbl"), vec![], false);
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        c.read_exact(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head).contains("200"));
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(drain(&mut c).await.contains(BODY2));
+    }
+
+    #[tokio::test]
+    async fn socks4_inbound_multi_hop_chain() {
+        let origin = s5_origin().await;
+        let hop = s5_hop().await;
+        let (proxies, chains) = two_hop_chain(hop, origin);
+        let srv = mk(proxies, Some(chains), Some("dbl"), vec![], false);
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        let mut req = vec![0x04, 0x01, 0x00, 0x50, 0x00, 0x00, 0x00, 0x01, 0x00];
+        req.extend_from_slice(b"example.com");
+        req.push(0x00);
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 8];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x5A);
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(drain(&mut c).await.contains(BODY2));
+    }
+
+    // ---- (2) IP AUTH path ----------------------------------------------
+
+    /// HTTP inbound, auth on, NO Proxy-Authorization header: authorised by
+    /// source IP (127.0.0.1/32), default_selection drives upstream by IP.
+    #[tokio::test]
+    async fn http_ip_auth_with_default_selection() {
+        let us = {
+            // fake HTTP origin that echoes IP-SEL
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut s, _)) = l.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        BODY2.len(),
+                        BODY2
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.flush().await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+            addr
+        };
+        let mut user = usr("ipme", "pw");
+        user.allowed_ips = vec!["127.0.0.1/32".into()];
+        user.default_selection = Some("ipme-country-us".into());
+        let proxies = vec![ProxyConfig {
+            label: Some("us".into()),
+            proxy_type: Proxy::Http,
+            address: us.ip().to_string(),
+            port: Some(us.port()),
+            username: None,
+            password: None,
+            tags: Tags {
+                country: Some("us".into()),
+                ..Default::default()
+            },
+        }];
+        let srv = mk(proxies, None, None, vec![user], true);
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        // No Proxy-Authorization -> IP auth path.
+        c.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(drain(&mut c).await.contains(BODY2));
+    }
+
+    /// SOCKS5 inbound, no-auth offered, auth disabled, but the account's
+    /// default_selection is resolved by source IP in handle_socks5.
+    #[tokio::test]
+    async fn socks5_ip_default_selection() {
+        let origin = s5_origin().await;
+        let mut user = usr("ipme", "pw");
+        user.allowed_ips = vec!["127.0.0.1/32".into()];
+        user.default_selection = Some("ipme-country-us".into());
+        let proxies = vec![ProxyConfig {
+            label: Some("us".into()),
+            proxy_type: Proxy::Socks5,
+            address: origin.ip().to_string(),
+            port: Some(origin.port()),
+            username: None,
+            password: None,
+            tags: Tags {
+                country: Some("us".into()),
+                ..Default::default()
+            },
+        }];
+        // auth disabled so SOCKS5 uses no-auth, but still hits IP default selection.
+        let srv = mk(proxies, None, None, vec![user], false);
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x00]);
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00);
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(drain(&mut c).await.contains(BODY2));
+    }
+
+    // ---- (3) bandwidth exceeded ----------------------------------------
+
+    #[tokio::test]
+    async fn http_bandwidth_exceeded_refused() {
+        let up = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = l.accept().await;
+            });
+            addr
+        };
+        let mut user = usr("me", "pw");
+        user.bandwidth_limit = Some(0);
+        let srv = mk(
+            vec![px("up", Proxy::Http, up)],
+            None,
+            Some("up"),
+            vec![user],
+            true,
+        );
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        let creds = base64::engine::general_purpose::STANDARD.encode("me:pw");
+        let req = format!(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        c.write_all(req.as_bytes()).await.unwrap();
+        // Refused -> no body, connection closed.
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf))
+            .await
+            .map(|r| r.unwrap_or(0))
+            .unwrap_or(0);
+        assert_eq!(n, 0, "expected closed connection on bandwidth refusal");
+    }
+
+    #[test]
+    fn check_bandwidth_paths() {
+        let cfg = rcfg(None, false);
+        assert!(check_bandwidth(None, "u", &cfg).is_ok());
+        assert!(check_bandwidth(Some(100), "u", &cfg).is_ok());
+        assert!(matches!(
+            check_bandwidth(Some(0), "u", &cfg),
+            Err(ProxyError::BandwidthExceeded)
+        ));
+        assert!(matches!(
+            check_bandwidth(Some(-5), "u", &cfg),
+            Err(ProxyError::BandwidthExceeded)
+        ));
+    }
+
+    // ---- (4) detect_protocol -------------------------------------------
+
+    #[test]
+    fn detect_protocol_all_and_errors() {
+        let srv = mk(
+            vec![px("x", Proxy::Http, "127.0.0.1:1".parse().unwrap())],
+            None,
+            None,
+            vec![],
+            false,
+        );
+        assert!(matches!(
+            srv.detect_protocol(&[0x05, 0x01, 0x00]).unwrap(),
+            Proxy::Socks5
+        ));
+        assert!(matches!(
+            srv.detect_protocol(&[0x04, 0x01]).unwrap(),
+            Proxy::Socks4
+        ));
+        assert!(matches!(
+            srv.detect_protocol(b"CONNECT host:443 HTTP/1.1\r\n")
+                .unwrap(),
+            Proxy::Https
+        ));
+        for m in [
+            "GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE", "PATCH",
+        ] {
+            let line = format!("{m} / HTTP/1.1\r\n");
+            assert!(matches!(
+                srv.detect_protocol(line.as_bytes()).unwrap(),
+                Proxy::Http
+            ));
+        }
+        // empty -> error
+        assert!(srv.detect_protocol(&[]).is_err());
+        // unrecognised text -> unsupported
+        assert!(matches!(
+            srv.detect_protocol(b"BREW / HTCPCP/1.0\r\n"),
+            Err(ProxyError::UnsupportedProtocol)
+        ));
+    }
+
+    // ---- (5) malformed SOCKS5 greeting ---------------------------------
+
+    /// Auth enabled but client offers only no-auth method -> server replies
+    /// 0x05 0xFF and drops.
+    #[tokio::test]
+    async fn socks5_no_acceptable_method() {
+        let srv = mk(
+            vec![px("up", Proxy::Socks5, "127.0.0.1:1".parse().unwrap())],
+            None,
+            Some("up"),
+            vec![usr("me", "pw")],
+            true,
+        );
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        // offer only no-auth (0x00); auth requires user/pass (0x02)
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        assert_eq!(r, [0x05, 0xFF]);
+    }
+
+    /// Greeting too short for SOCKS5 -> detected as SOCKS5 then rejected.
+    #[tokio::test]
+    async fn socks5_greeting_too_short() {
+        let srv = mk(
+            vec![px("up", Proxy::Socks5, "127.0.0.1:1".parse().unwrap())],
+            None,
+            Some("up"),
+            vec![],
+            false,
+        );
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        // 2 bytes only: < 3 -> "Invalid SOCKS5 greeting length"
+        c.write_all(&[0x05, 0x00]).await.unwrap();
+        let mut r = [0u8; 2];
+        assert!(c.read_exact(&mut r).await.is_err());
+    }
+
+    /// Bad SOCKS5 version in greeting (0x05 detected, but request[0] checked
+    /// again as 0x05; here we send 0x05 with declared nmethods exceeding the
+    /// buffer to hit the "insufficient methods" branch).
+    #[tokio::test]
+    async fn socks5_insufficient_methods() {
+        let srv = mk(
+            vec![px("up", Proxy::Socks5, "127.0.0.1:1".parse().unwrap())],
+            None,
+            Some("up"),
+            vec![],
+            false,
+        );
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        // version=5, nmethods=5, but only 1 method byte present
+        c.write_all(&[0x05, 0x05, 0x00]).await.unwrap();
+        let mut r = [0u8; 2];
+        assert!(c.read_exact(&mut r).await.is_err());
+    }
+}

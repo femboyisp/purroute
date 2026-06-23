@@ -424,3 +424,128 @@ mod tests {
         assert!(StaticAuthBackend::new(&[u]).is_err());
     }
 }
+
+#[cfg(test)]
+mod auth_cov {
+    use super::*;
+
+    fn cfg(name: &str, pw: &str, limit: Option<i64>) -> UserConfig {
+        UserConfig {
+            username: name.into(),
+            password: pw.into(),
+            bandwidth_limit: limit,
+            allowed_ips: Vec::new(),
+            default_selection: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticate_hit_surfaces_default_selection_and_limit() {
+        let mut u = cfg("me", "pw", Some(4096));
+        u.default_selection = Some("country-de".into());
+        let b = StaticAuthBackend::new(&[u]).unwrap();
+        let a = b.authenticate("me", "pw").await.unwrap().expect("hit");
+        assert_eq!(a.id, 1);
+        assert_eq!(a.bandwidth_limit, Some(4096));
+        assert_eq!(a.default_selection.as_deref(), Some("country-de"));
+    }
+
+    #[tokio::test]
+    async fn authenticate_miss_unknown_and_wrong_password() {
+        let b = StaticAuthBackend::new(&[cfg("me", "secret", None)]).unwrap();
+        assert!(b.authenticate("nobody", "secret").await.unwrap().is_none());
+        assert!(b.authenticate("me", "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn second_user_gets_id_two() {
+        let b = StaticAuthBackend::new(&[cfg("a", "1", None), cfg("b", "2", None)]).unwrap();
+        let a = b.authenticate("b", "2").await.unwrap().unwrap();
+        assert_eq!(a.id, 2);
+    }
+
+    #[test]
+    fn constant_time_eq_length_mismatch_and_content() {
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[tokio::test]
+    async fn ip_auth_exact_bare_ip_and_cidr_and_nonmatch() {
+        let mut u = cfg("ip", "x", None);
+        u.allowed_ips = vec!["10.0.0.0/24".into(), "1.2.3.4".into()];
+        let b = StaticAuthBackend::new(&[u]).unwrap();
+
+        assert!(b
+            .authenticate_by_ip("1.2.3.4".parse().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(b
+            .authenticate_by_ip("10.0.0.7".parse().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        // bare ip is a /32 host: a neighbour is not authorised
+        assert!(b
+            .authenticate_by_ip("1.2.3.5".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(b
+            .authenticate_by_ip("10.0.1.1".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn parse_net_accepts_cidr_bare_and_rejects_garbage() {
+        assert!(parse_net("10.0.0.0/24").is_ok());
+        assert!(parse_net("1.2.3.4").is_ok());
+        // invalid CIDR prefix and non-ip both error gracefully (no panic)
+        assert!(parse_net("10.0.0.0/99").is_err());
+        assert!(parse_net("definitely not an ip").is_err());
+    }
+
+    #[test]
+    fn invalid_cidr_in_allowed_ips_is_startup_error() {
+        let mut u = cfg("bad", "x", None);
+        u.allowed_ips = vec!["10.0.0.0/99".into()];
+        assert!(StaticAuthBackend::new(&[u]).is_err());
+    }
+
+    #[tokio::test]
+    async fn report_usage_accumulates_and_floors() {
+        let b = StaticAuthBackend::new(&[cfg("u", "p", Some(1000))]).unwrap();
+        b.report_usage(1, 100, 100).await.unwrap();
+        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        assert_eq!(a.bandwidth_limit, Some(800));
+        b.report_usage(1, 300, 0).await.unwrap();
+        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        assert_eq!(a.bandwidth_limit, Some(500));
+        b.report_usage(1, 10_000, 0).await.unwrap();
+        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        assert_eq!(a.bandwidth_limit, Some(0));
+    }
+
+    #[tokio::test]
+    async fn report_usage_unlimited_is_noop() {
+        let b = StaticAuthBackend::new(&[cfg("u", "p", None)]).unwrap();
+        b.report_usage(1, 5, 5).await.unwrap();
+        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        assert_eq!(a.bandwidth_limit, None);
+    }
+
+    #[tokio::test]
+    async fn report_usage_out_of_range_id_is_ignored() {
+        let b = StaticAuthBackend::new(&[cfg("u", "p", Some(1000))]).unwrap();
+        // id 0 -> idx underflow None; id 99 -> no such user
+        b.report_usage(0, 10, 10).await.unwrap();
+        b.report_usage(99, 10, 10).await.unwrap();
+        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        assert_eq!(a.bandwidth_limit, Some(1000));
+    }
+}
