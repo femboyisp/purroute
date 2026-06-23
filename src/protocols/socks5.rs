@@ -109,6 +109,11 @@ impl Socks5 {
                 String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen])
                     .to_string();
 
+            // Authenticate with the *base* username (routing tokens stripped).
+            let username = crate::routing::parse_username(&username)
+                .map(|(base, _sel)| base)
+                .unwrap_or(username);
+
             // Authenticate via the pluggable auth backend.
             match auth.authenticate(&username, &password).await {
                 Ok(Some(account)) => {

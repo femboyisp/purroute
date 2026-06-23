@@ -1323,6 +1323,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "ipnet",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",

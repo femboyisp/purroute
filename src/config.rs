@@ -34,6 +34,13 @@ pub struct UserConfig {
     pub password: String,
     /// Remaining traffic allowance in bytes. Omit for unlimited.
     pub bandwidth_limit: Option<i64>,
+    /// Source IPs allowed to authenticate as this user without credentials.
+    /// Exact addresses or CIDR ranges (e.g. `"10.0.0.0/24"`).
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// Default routing selection (username-token format) applied when a
+    /// connection specifies none — e.g. `"country-us-isp-comcast"`.
+    pub default_selection: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +84,18 @@ pub struct ChainConfig {
     pub count: Option<usize>,
 }
 
+/// Routing tags shared by upstreams and chains. All optional; an absent tag
+/// matches only when a selection does not constrain that dimension.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Tags {
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub isp: Option<String>,
+    /// `residential` | `mobile` | `datacenter`.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyConfig {
     pub label: Option<String>,
@@ -85,6 +104,8 @@ pub struct ProxyConfig {
     pub port: Option<u16>,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(flatten)]
+    pub tags: Tags,
 }
 
 impl ProxyConfig {
