@@ -16,7 +16,9 @@ metrics_listen = "127.0.0.1:9100"                # (Optional) Local-only Prometh
 [[user]]
 username = "me"
 password = "hunter2"
-# bandwidth_limit = 1073741824   # (Optional) remaining bytes; omit for unlimited
+# bandwidth_limit = 1073741824    # (Optional) remaining bytes; omit for unlimited
+# allowed_ips = ["10.0.0.0/24"]   # (Optional) source IPs/CIDRs that skip user/pass auth
+# default_selection = "country-us" # (Optional) routing tokens for credential-less conns
 
 # (b) PostgreSQL backend (many users): uncomment [database] and remove [[user]].
 # Accounts live in the `accounts` table (username/password + bandwidth_limit);
@@ -33,6 +35,12 @@ password = "hunter2"
 label = "Tor"                          # Proxy types supported: Http, Https, Socks4, Socks5
 proxy_type = "Socks5"
 address = "127.0.0.1:9050"                      # If port is not specified (ie: in onion/i2p addresses) we default to 80
+# Optional exit tags — clients select against these with routing tokens in the
+# username, e.g. me-country-us-type-residential. See the wiki: Routing-tokens.
+# country = "us"
+# city = "nyc"
+# isp = "comcast"
+# type = "residential"
 
 [[proxy]]
 label = "HttpProxy"
