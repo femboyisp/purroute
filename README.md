@@ -16,7 +16,13 @@ bandwidth_limit)` and reports usage.
 - Auto-detection of the inbound protocol — one endpoint serves every client type.
 - Protocol translation across all inbound→upstream combinations.
 - Multi-hop chaining (strict or random order) for every inbound protocol.
-- Pluggable authentication (`AuthBackend`): inline users (no database) or PostgreSQL.
+- **Tag-based exit selection** — tag upstreams with `country`/`city`/`isp`/`type`
+  and let clients pick an exit by encoding routing tokens in the proxy username
+  (`me-country-us,de-type-residential-session-ab12`); comma = a set to rotate
+  across, `session` pins one exit, no match fails closed.
+- Pluggable authentication (`AuthBackend`): inline users (no database) or
+  PostgreSQL, by **username/password or source IP** (`allowed_ips`), with an
+  optional per-account `default_selection` for credential-less connections.
 - Local-only Prometheus `/metrics` endpoint.
 
 ## Quick start (single user, no database)
@@ -36,15 +42,23 @@ chain = "exit"
 [[user]]
 username = "me"
 password = "hunter2"
-# bandwidth_limit = 1073741824   # optional, bytes; omit for unlimited
+# bandwidth_limit = 1073741824    # optional, bytes; omit for unlimited
+# allowed_ips = ["10.0.0.0/24"]   # optional, source IPs that skip auth
+# default_selection = "country-us" # optional, route for credential-less conns
 
 [[proxy]]
 label = "exit"
 proxy_type = "Socks5"
 address = "10.0.0.1:1080"
+# country = "us"                  # optional tags for routing-token selection
+# city = "nyc"
+# isp = "comcast"
+# type = "residential"
 ```
 
-Point any proxy client at `127.0.0.1:1080` with `me:hunter2`.
+Point any proxy client at `127.0.0.1:1080` with `me:hunter2`. With tagged
+upstreams, select an exit by appending tokens to the username, e.g.
+`me-country-us-type-residential`.
 
 For many users, add a `[database]` section (and `docker-compose up --build` for a
 local PostgreSQL) instead of `[[user]]` blocks. See `config.toml.example` for the
