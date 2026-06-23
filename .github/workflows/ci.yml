@@ -38,3 +38,18 @@ jobs:
       - run: cargo build
       # Unit tests only; the integration suite needs live proxy containers.
       - run: cargo test --bins
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Hermetic in-crate tests only (no containers). The TUI dashboard and the
+      # main() wiring are excluded — they're driven by the binary, not unit-tested.
+      - run: >
+          cargo llvm-cov --bins --fail-under-lines 90
+          --ignore-filename-regex '(main\.rs|stats/display\.rs)'
