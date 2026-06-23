@@ -9,7 +9,7 @@ use crate::protocol::Protocol as Proxy;
 // src/protocols/proxy.rs
 use crate::{
     config::{ChainConfig, ProxyConfig, RouterConfig},
-    protocols::{ChainConnector, Http, Https, Socks4, Socks5},
+    protocols::{ChainConnector, Http, Https, Socks4},
     stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
 use base64::Engine;
@@ -164,16 +164,18 @@ impl ProxyServer {
         Ok(vec![proxy])
     }
 
-    /// Handle SOCKS5 connection with multi-hop chain
-    async fn handle_socks5_chain(
+    /// Handle a SOCKS5 connection: greeting + auth (extracting any routing
+    /// selection from the username), then resolve the upstream by that selection
+    /// and tunnel through it (single- or multi-hop) via `ChainConnector`.
+    async fn handle_socks5(
         &self,
         mut client: TcpStream,
         initial_request: Vec<u8>,
-        proxy_chain: Vec<ProxyConfig>,
         peer_addr: SocketAddr,
         global_stats: Arc<GlobalStats>,
     ) -> Result<(), ProxyError> {
         let stats = get_global_stats();
+        let mut selection = crate::routing::Selection::default();
 
         // Parse SOCKS5 greeting (already received in initial_request)
         stats.add_bytes_in(as_u64(initial_request.len()));
@@ -244,9 +246,10 @@ impl ProxyServer {
                 String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen])
                     .to_string();
 
-            // Authenticate with the base username (routing tokens stripped).
-            let (username, _selection) =
+            // Authenticate with the base username; keep the routing selection.
+            let (username, sel) =
                 crate::routing::parse_username(&username).map_err(|_| ProxyError::AuthFailed)?;
+            selection = sel;
             let account = self
                 .auth
                 .authenticate(&username, &password)
@@ -329,7 +332,20 @@ impl ProxyServer {
             _ => return Err(ProxyError::Protocol("Unsupported address type".into())),
         };
 
-        // Use ChainConnector to establish upstream connection through the chain
+        // No token selection: fall back to the account's stored default (by IP).
+        if selection.is_empty() {
+            if let Ok(Some(account)) = self.auth.authenticate_by_ip(peer_addr.ip()).await {
+                if let Some(def) = account.default_selection {
+                    if let Ok((_base, sel)) = crate::routing::parse_username(&def) {
+                        selection = sel;
+                    }
+                }
+            }
+        }
+
+        // Resolve the upstream by the selection (single- or multi-hop), then tunnel.
+        let proxy_chain = self.resolve_proxy_chain(&selection)?;
+        metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
 
@@ -543,15 +559,11 @@ impl ProxyServer {
                 let multi_hop = proxy_chain.len() > 1;
 
                 match protocol {
-                    Proxy::Socks5 if multi_hop => {
+                    // SOCKS5 resolves its own upstream after auth (its username,
+                    // and any routing tokens, arrive in the auth sub-negotiation).
+                    Proxy::Socks5 => {
                         server
-                            .handle_socks5_chain(
-                                client,
-                                initial_request,
-                                proxy_chain,
-                                peer_addr,
-                                global_stats.clone(),
-                            )
+                            .handle_socks5(client, initial_request, peer_addr, global_stats.clone())
                             .await
                     }
                     Proxy::Socks4 if multi_hop => {
@@ -584,33 +596,6 @@ impl ProxyServer {
                                 proxy_chain,
                                 peer_addr,
                                 global_stats.clone(),
-                            )
-                            .await
-                    }
-                    Proxy::Socks5 => {
-                        let (user_account, client_stream, upstream_stream) = Socks5::handle(
-                            client,
-                            &target_proxy.get_upstream_addr(),
-                            initial_request,
-                            target_proxy,
-                            server.config.clone(),
-                            server.auth.as_ref(),
-                        )
-                        .await?;
-
-                        global_stats.record_connection_result(
-                            true,
-                            format!("Socks5 Connection successful for {}", peer_addr),
-                            &server.config,
-                        );
-
-                        server
-                            .proxy_data(
-                                client_stream,
-                                upstream_stream,
-                                peer_addr,
-                                global_stats.clone(),
-                                user_account,
                             )
                             .await
                     }
