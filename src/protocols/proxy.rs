@@ -1237,3 +1237,449 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod loopback {
+    //! Hermetic, in-process integration tests. Each test stands up a fake
+    //! upstream proxy on loopback, runs a real [`ProxyServer`] over an accepted
+    //! TCP socket, and drives a client through the full handshake — no
+    //! containers, no network. Exercises the protocol handlers, routing
+    //! selection, auth and the relay path end to end.
+    use super::*;
+    use crate::auth::StaticAuthBackend;
+    use crate::config::{Tags, UserConfig};
+    use std::time::Duration;
+
+    const BODY: &str = "Test Page";
+
+    fn proxy(label: &str, kind: Proxy, addr: SocketAddr, tags: Tags) -> ProxyConfig {
+        ProxyConfig {
+            label: Some(label.to_owned()),
+            proxy_type: kind,
+            address: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: None,
+            password: None,
+            tags,
+        }
+    }
+
+    fn user(name: &str, pass: &str) -> UserConfig {
+        UserConfig {
+            username: name.to_owned(),
+            password: pass.to_owned(),
+            bandwidth_limit: None,
+            allowed_ips: Vec::new(),
+            default_selection: None,
+        }
+    }
+
+    fn router_cfg(chain: Option<&str>, auth: bool) -> Arc<RouterConfig> {
+        Arc::new(RouterConfig {
+            listen: "127.0.0.1:0".into(),
+            chain: chain.map(str::to_owned),
+            log: Some(false),
+            verbose: Some(false),
+            debug: Some(false),
+            auth: Some(auth),
+            metrics_listen: None,
+        })
+    }
+
+    fn build(
+        proxies: Vec<ProxyConfig>,
+        chains: Option<Vec<ChainConfig>>,
+        chain: Option<&str>,
+        users: Vec<UserConfig>,
+    ) -> ProxyServer {
+        let auth = Arc::new(StaticAuthBackend::new(&users).unwrap());
+        let display = Arc::new(StatsDisplay::new(
+            get_global_stats(),
+            Duration::from_secs(60),
+            None,
+        ));
+        ProxyServer::new(
+            proxies,
+            chains,
+            display,
+            router_cfg(chain, !users.is_empty()),
+            auth,
+        )
+    }
+
+    /// Bind the router and serve exactly one accepted connection.
+    async fn serve_once(srv: ProxyServer) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, peer)) = listener.accept().await {
+                let _ = srv.handle_connection(stream, peer, None).await;
+            }
+        });
+        addr
+    }
+
+    /// Fake HTTP upstream proxy: read the forwarded request, reply with `body`.
+    async fn fake_http_upstream(body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        addr
+    }
+
+    /// Fake SOCKS5 upstream proxy: no-auth handshake, accept CONNECT, reply
+    /// success, then serve an HTTP `body` as the origin.
+    async fn fake_socks5_upstream(body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                // greeting
+                let mut g = [0u8; 2];
+                s.read_exact(&mut g).await.unwrap();
+                let mut methods = vec![0u8; g[1] as usize];
+                s.read_exact(&mut methods).await.unwrap();
+                s.write_all(&[0x05, 0x00]).await.unwrap(); // no-auth
+                                                           // CONNECT request header
+                let mut h = [0u8; 4];
+                s.read_exact(&mut h).await.unwrap();
+                match h[3] {
+                    0x01 => {
+                        let mut a = [0u8; 6];
+                        s.read_exact(&mut a).await.unwrap();
+                    }
+                    0x03 => {
+                        let mut l = [0u8; 1];
+                        s.read_exact(&mut l).await.unwrap();
+                        let mut d = vec![0u8; l[0] as usize + 2];
+                        s.read_exact(&mut d).await.unwrap();
+                    }
+                    _ => {}
+                }
+                // success reply, bound 0.0.0.0:0
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                // read tunnelled request, answer as origin
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        addr
+    }
+
+    /// Fake SOCKS4 upstream proxy: accept CONNECT, grant, then serve `body`.
+    async fn fake_socks4_upstream(body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                // VN CD PORT(2) IP(4) then userid\0 [domain\0]
+                let mut head = [0u8; 8];
+                s.read_exact(&mut head).await.unwrap();
+                // consume userid until null
+                let mut b = [0u8; 1];
+                loop {
+                    s.read_exact(&mut b).await.unwrap();
+                    if b[0] == 0 {
+                        break;
+                    }
+                }
+                // socks4a domain (IP 0.0.0.x): consume domain until null
+                if head[4] == 0 && head[5] == 0 && head[6] == 0 && head[7] != 0 {
+                    loop {
+                        s.read_exact(&mut b).await.unwrap();
+                        if b[0] == 0 {
+                            break;
+                        }
+                    }
+                }
+                // granted: VN=0 CD=0x5A + 6 bytes
+                s.write_all(&[0x00, 0x5A, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        addr
+    }
+
+    /// Fake HTTP upstream that honours a CONNECT tunnel: it replies
+    /// `200 Connection Established`, then serves `body` over the tunnel.
+    async fn fake_connect_upstream(body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await; // CONNECT host:port ...
+                s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = s.read(&mut buf).await; // tunnelled client request
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        addr
+    }
+
+    fn basic(creds: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(creds)
+    }
+
+    async fn read_body(s: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(2), s.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(BODY.len()).any(|w| w == BODY.as_bytes())
+                        || String::from_utf8_lossy(&buf).contains("EXIT")
+                    {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn http_inbound_through_http_upstream() {
+        let up = fake_http_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Http, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_body(&mut c).await.contains(BODY));
+    }
+
+    #[tokio::test]
+    async fn socks5_inbound_through_socks5_upstream_with_auth() {
+        let up = fake_socks5_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Socks5, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![user("me", "pw")],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        // greeting: offer user/pass
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x02]);
+        // auth
+        c.write_all(&[0x01, 2, b'm', b'e', 2, b'p', b'w'])
+            .await
+            .unwrap();
+        let mut ar = [0u8; 2];
+        c.read_exact(&mut ar).await.unwrap();
+        assert_eq!(ar, [0x01, 0x00]);
+        // CONNECT example.com:80
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00);
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_body(&mut c).await.contains(BODY));
+    }
+
+    #[tokio::test]
+    async fn socks5_inbound_rejects_bad_password() {
+        let up = fake_socks5_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Socks5, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![user("me", "right")],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        c.write_all(&[0x01, 2, b'm', b'e', 5, b'w', b'r', b'o', b'n', b'g'])
+            .await
+            .unwrap();
+        // server drops the connection on auth failure
+        let mut ar = [0u8; 2];
+        let r = c.read_exact(&mut ar).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn socks4_inbound_through_socks4_upstream() {
+        let up = fake_socks4_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Socks4, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        // SOCKS4a CONNECT example.com:80, empty userid, domain
+        let mut req = vec![0x04, 0x01, 0x00, 0x50, 0x00, 0x00, 0x00, 0x01, 0x00];
+        req.extend_from_slice(b"example.com");
+        req.push(0x00);
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 8];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x5A);
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_body(&mut c).await.contains(BODY));
+    }
+
+    #[tokio::test]
+    async fn routing_token_selects_tagged_upstream() {
+        let us = fake_http_upstream("US-EXIT").await;
+        let de = fake_http_upstream("DE-EXIT").await;
+        let tag = |cc: &str| Tags {
+            country: Some(cc.to_owned()),
+            ..Default::default()
+        };
+        let srv = build(
+            vec![
+                proxy("us", Proxy::Http, us, tag("us")),
+                proxy("de", Proxy::Http, de, tag("de")),
+            ],
+            None,
+            None,
+            vec![user("me", "pw")],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        let auth = basic("me-country-de:pw");
+        let reqs = format!(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            auth
+        );
+        c.write_all(reqs.as_bytes()).await.unwrap();
+        assert!(read_body(&mut c).await.contains("DE-EXIT"));
+    }
+
+    #[tokio::test]
+    async fn routing_no_match_is_rejected() {
+        let us = fake_http_upstream("US-EXIT").await;
+        let srv = build(
+            vec![proxy(
+                "us",
+                Proxy::Http,
+                us,
+                Tags {
+                    country: Some("us".to_owned()),
+                    ..Default::default()
+                },
+            )],
+            None,
+            None,
+            vec![user("me", "pw")],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        let auth = basic("me-country-fr:pw");
+        let reqs = format!(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            auth
+        );
+        c.write_all(reqs.as_bytes()).await.unwrap();
+        // no matching upstream -> connection closed with no body
+        assert!(!read_body(&mut c).await.contains("EXIT"));
+    }
+
+    #[tokio::test]
+    async fn https_connect_inbound_through_http_upstream() {
+        let up = fake_connect_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Http, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        // router replies 200 Connection Established, then tunnels
+        let mut head = [0u8; 12];
+        c.read_exact(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head).contains("200"));
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_body(&mut c).await.contains(BODY));
+    }
+
+    #[tokio::test]
+    async fn http_inbound_through_socks4_upstream() {
+        let up = fake_socks4_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Socks4, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_body(&mut c).await.contains(BODY));
+    }
+}
