@@ -552,3 +552,382 @@ mod http_cov {
         (addr, h)
     }
 }
+
+#[cfg(test)]
+mod http_cov2 {
+    //! Additional hermetic coverage for the SOCKS5 upstream branch of
+    //! [`Http::handle`] and remaining edge cases. Each test stands up a fake
+    //! SOCKS5 (or SOCKS4) upstream on loopback and drives `Http::handle` with a
+    //! no-op `proxy_data`. No network, no sleeps beyond a short drain.
+    use super::*;
+    use crate::config::Tags;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    type RelayFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>>;
+
+    fn noop_proxy_data() -> impl Fn(TcpStream, TcpStream, Arc<GlobalStats>) -> RelayFut {
+        |_c, _u, _s| Box::pin(async { Ok(()) })
+    }
+
+    fn proxy(kind: Proxy, addr: SocketAddr) -> ProxyConfig {
+        ProxyConfig {
+            label: Some("t".into()),
+            proxy_type: kind,
+            address: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: None,
+            password: None,
+            tags: Tags::default(),
+        }
+    }
+
+    fn req(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    async fn client_to(addr: SocketAddr) -> TcpStream {
+        TcpStream::connect(addr).await.unwrap()
+    }
+
+    /// A loopback peer that accepts and drains; usable as the "client" side.
+    async fn throwaway_peer() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Build a SOCKS5 connect-reply tail for the requested `atyp` byte. The
+    /// reply is `05 00 00 <atyp>` followed by an address of the matching shape.
+    fn socks5_reply(atyp: u8) -> Vec<u8> {
+        let mut v = vec![0x05, 0x00, 0x00, atyp];
+        match atyp {
+            0x01 => v.extend_from_slice(&[127, 0, 0, 1, 0, 80]),
+            0x03 => {
+                let host = b"x";
+                v.push(host.len() as u8);
+                v.extend_from_slice(host);
+                v.extend_from_slice(&[0, 80]);
+            }
+            0x04 => v.extend_from_slice(&[0u8; 18]),
+            _ => {}
+        }
+        v
+    }
+
+    /// Configurable fake SOCKS5 upstream.
+    ///
+    /// - `auth`: if true, select user/pass method (0x02) and accept the creds;
+    ///   if false, select no-auth (0x00).
+    /// - `auth_ok`: reply code for the user/pass sub-negotiation.
+    /// - `connect_code`: REP byte for the connect reply (0x00 = success).
+    /// - `atyp`: address type in the connect reply.
+    fn fake_socks5(auth: bool, auth_ok: bool, connect_code: u8, atyp: u8) -> SocketAddr {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind socks5 fake upstream");
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                // Greeting: VER NMETHODS METHODS...
+                let mut head = [0u8; 2];
+                if s.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                let _ = s.read_exact(&mut methods).await;
+
+                let method = if auth { 0x02u8 } else { 0x00u8 };
+                let _ = s.write_all(&[0x05, method]).await;
+
+                if auth {
+                    // Sub-negotiation: VER ULEN UNAME PLEN PASSWD
+                    let mut h = [0u8; 2];
+                    if s.read_exact(&mut h).await.is_err() {
+                        return;
+                    }
+                    let mut uname = vec![0u8; h[1] as usize];
+                    let _ = s.read_exact(&mut uname).await;
+                    let mut pl = [0u8; 1];
+                    let _ = s.read_exact(&mut pl).await;
+                    let mut passwd = vec![0u8; pl[0] as usize];
+                    let _ = s.read_exact(&mut passwd).await;
+                    let code = if auth_ok { 0x00 } else { 0x01 };
+                    let _ = s.write_all(&[0x01, code]).await;
+                    if !auth_ok {
+                        return;
+                    }
+                }
+
+                // Connect request: VER CMD RSV ATYP ... ; read VER CMD RSV ATYP
+                let mut creq = [0u8; 4];
+                if s.read_exact(&mut creq).await.is_err() {
+                    return;
+                }
+                // ATYP 0x03 (domain): LEN then host then 2 port bytes.
+                if creq[3] == 0x03 {
+                    let mut l = [0u8; 1];
+                    let _ = s.read_exact(&mut l).await;
+                    let mut rest = vec![0u8; l[0] as usize + 2];
+                    let _ = s.read_exact(&mut rest).await;
+                }
+
+                let reply = {
+                    let mut v = socks5_reply(atyp);
+                    v[1] = connect_code;
+                    v
+                };
+                let _ = s.write_all(&reply).await;
+
+                // Drain whatever the handler forwards (request or nothing).
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn socks5_missing_host_header_is_protocol_error() {
+        let up = fake_socks5(false, true, 0x00, 0x01);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET / HTTP/1.1\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn socks5_noauth_plain_http_forwards_request() {
+        let up = fake_socks5(false, true, 0x00, 0x01);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_connect_succeeds() {
+        let up = fake_socks5(true, true, 0x00, 0x03);
+        let mut cfg = proxy(Proxy::Socks5, up);
+        cfg.username = Some("alice".into());
+        cfg.password = Some("s3cret".into());
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_rejected_is_protocol_error() {
+        let up = fake_socks5(true, false, 0x00, 0x01);
+        let mut cfg = proxy(Proxy::Socks5, up);
+        cfg.username = Some("alice".into());
+        cfg.password = Some("bad".into());
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_required_but_creds_absent_is_protocol_error() {
+        // Upstream selects user/pass (0x02) but config has no creds.
+        let up = fake_socks5(true, true, 0x00, 0x01);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn socks5_unsupported_method_is_protocol_error() {
+        // No-auth requested by config, but upstream returns method 0xFF.
+        let up = fake_socks5_method(0xFF);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    /// SOCKS5 upstream that just replies a chosen method byte then closes.
+    fn fake_socks5_method(method: u8) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut head = [0u8; 2];
+                if s.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                let _ = s.read_exact(&mut methods).await;
+                let _ = s.write_all(&[0x05, method]).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_failure_is_protocol_error() {
+        let up = fake_socks5(false, true, 0x05, 0x01);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn socks5_ipv4_reply_atyp_succeeds() {
+        let up = fake_socks5(false, true, 0x00, 0x01);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn socks5_ipv6_reply_atyp_succeeds() {
+        let up = fake_socks5(false, true, 0x00, 0x04);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn socks5_invalid_reply_atyp_is_protocol_error() {
+        let up = fake_socks5(false, true, 0x00, 0x09);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn socks5_default_port_when_host_has_no_port() {
+        // Host header without an explicit port exercises the unwrap_or("80") path.
+        let up = fake_socks5(false, true, 0x00, 0x01);
+        let cfg = proxy(Proxy::Socks5, up);
+        let upstream_addr = format!("{}:{}", up.ip(), up.port());
+        let client = client_to(throwaway_peer().await).await;
+
+        let r = Http::handle(
+            client,
+            &upstream_addr,
+            req("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            &cfg,
+            noop_proxy_data(),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+}

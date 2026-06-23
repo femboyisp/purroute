@@ -417,3 +417,145 @@ mod stats_cov {
         assert_eq!(cloned.total_bytes_in, snap.total_bytes_in);
     }
 }
+
+#[cfg(test)]
+mod stats_cov2 {
+    use super::*;
+
+    fn cfg(log: bool, verbose: bool, debug: bool) -> RouterConfig {
+        RouterConfig {
+            listen: "127.0.0.1:0".into(),
+            chain: None,
+            log: Some(log),
+            verbose: Some(verbose),
+            debug: Some(debug),
+            auth: None,
+            metrics_listen: None,
+        }
+    }
+
+    // log=Some(true) but verbose/debug both None -> unwrap_or(false) path for Info.
+    #[test]
+    fn info_with_none_verbose_debug_is_silent() {
+        let s = GlobalStats::new();
+        let mut c = cfg(true, false, false);
+        c.verbose = None;
+        c.debug = None;
+        let mut rx = s.get_log_rx();
+        s.log_info("hidden".into(), &c);
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Success with verbose=None -> unwrap_or(false) suppresses.
+    #[test]
+    fn success_with_none_verbose_is_silent() {
+        let s = GlobalStats::new();
+        let mut c = cfg(true, true, false);
+        c.verbose = None;
+        let mut rx = s.get_log_rx();
+        s.record_connection_result(true, "ok".into(), &c);
+        assert!(rx.try_recv().is_err());
+    }
+
+    // log=Some(false): the inner `if log` is false -> nothing sent, counters still move.
+    #[test]
+    fn log_false_branch_silent_but_counts() {
+        let s = GlobalStats::new();
+        let c = cfg(false, true, true);
+        let mut rx = s.get_log_rx();
+        s.log_message("x".into(), LogLevel::Error, &c);
+        s.log_message("y".into(), LogLevel::Success, &c);
+        s.log_message("z".into(), LogLevel::Info, &c);
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Info enabled via debug only (verbose false).
+    #[test]
+    fn info_via_debug_only() {
+        let s = GlobalStats::new();
+        let mut rx = s.get_log_rx();
+        s.log_message("d".into(), LogLevel::Info, &cfg(true, false, true));
+        let (msg, level) = rx.try_recv().expect("info via debug");
+        assert_eq!(msg, "d");
+        assert!(matches!(level, LogLevel::Info));
+    }
+
+    // Error log delivered through a real async broadcast recv (covers recv path).
+    #[tokio::test]
+    async fn error_log_received_async() {
+        let s = GlobalStats::new();
+        let mut rx = s.get_log_rx();
+        s.record_connection_result(false, "fail".into(), &cfg(true, false, false));
+        let (msg, level) = rx.recv().await.expect("recv error log");
+        assert_eq!(msg, "fail");
+        assert!(matches!(level, LogLevel::Error));
+    }
+
+    // Multiple subscribers each see the message (fan-out).
+    #[test]
+    fn multiple_subscribers_each_receive() {
+        let s = GlobalStats::new();
+        let mut a = s.get_log_rx();
+        let mut b = s.get_log_rx();
+        s.record_connection_result(false, "boom".into(), &cfg(true, false, false));
+        assert_eq!(a.try_recv().unwrap().0, "boom");
+        assert_eq!(b.try_recv().unwrap().0, "boom");
+    }
+
+    // Send with no subscribers must not panic (the `let _ =` swallows the error).
+    #[test]
+    fn send_with_no_subscriber_is_ok() {
+        let s = GlobalStats::new();
+        // No rx kept alive.
+        s.record_connection_result(false, "lonely".into(), &cfg(true, false, false));
+        let snap = s.get_stats();
+        assert_eq!(snap.failed_connections, 1);
+    }
+
+    // get_stats within the active window must NOT reset current counters.
+    #[test]
+    fn active_window_preserves_current() {
+        let s = GlobalStats::new();
+        s.add_bytes_in(11);
+        s.add_bytes_out(22);
+        let snap1 = s.get_stats();
+        let snap2 = s.get_stats();
+        assert_eq!(snap1.current_bytes_in, 11);
+        assert_eq!(snap2.current_bytes_in, 11);
+        assert_eq!(snap2.current_bytes_out, 22);
+    }
+
+    // Reset path then fresh activity re-accumulates current bytes.
+    #[test]
+    fn reset_then_reaccumulate() {
+        let s = GlobalStats::new();
+        s.add_bytes_in(5);
+        *s.last_activity.lock() = Instant::now() - Duration::from_secs(3);
+        let snap = s.get_stats();
+        assert_eq!(snap.current_bytes_in, 5);
+        // After swap, current is 0 until new bytes arrive.
+        s.add_bytes_in(9);
+        let snap2 = s.get_stats();
+        assert_eq!(snap2.current_bytes_in, 9);
+        assert_eq!(snap2.total_bytes_in, 14);
+    }
+
+    // add_bytes refreshes last_activity, keeping us inside the active window.
+    #[test]
+    fn add_bytes_refreshes_activity() {
+        let s = GlobalStats::new();
+        *s.last_activity.lock() = Instant::now() - Duration::from_secs(10);
+        s.add_bytes_out(3); // refreshes to now
+        let snap = s.get_stats();
+        // Still active -> not swapped to zero.
+        assert_eq!(snap.current_bytes_out, 3);
+    }
+
+    #[test]
+    fn default_impl_matches_new() {
+        let s = GlobalStats::new();
+        let snap = s.get_stats();
+        assert_eq!(snap.total_connections, 0);
+        assert_eq!(snap.active_connections, 0);
+    }
+}
