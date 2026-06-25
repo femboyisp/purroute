@@ -81,6 +81,11 @@ impl PostgresAuthBackend {
         client
             .batch_execute(
                 "
+                -- Serialise schema creation: CREATE ... IF NOT EXISTS is not
+                -- race-safe, and the router + an external backend may initialise
+                -- the same database concurrently. Session lock; released at end.
+                SELECT pg_advisory_lock(4503599627370497);
+
                 CREATE SEQUENCE IF NOT EXISTS account_id_seq;
 
                 CREATE TABLE IF NOT EXISTS public.global (
@@ -132,6 +137,8 @@ impl PostgresAuthBackend {
 
                 CREATE INDEX IF NOT EXISTS idx_accounts_username ON public.accounts(username);
                 CREATE INDEX IF NOT EXISTS idx_user_stats_id ON public.user_stats(id);
+
+                SELECT pg_advisory_unlock(4503599627370497);
                 ",
             )
             .await
