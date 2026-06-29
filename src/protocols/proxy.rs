@@ -1271,6 +1271,7 @@ mod loopback {
             username: None,
             password: None,
             tags,
+            cost_per_byte: 1.0,
         }
     }
 
@@ -1829,6 +1830,7 @@ mod proxy_cov2 {
             username: None,
             password: None,
             tags: Tags::default(),
+            cost_per_byte: 1.0,
         }
     }
 
@@ -2091,6 +2093,7 @@ mod proxy_cov2 {
                 country: Some("us".into()),
                 ..Default::default()
             },
+            cost_per_byte: 1.0,
         }];
         let srv = mk(proxies, None, None, vec![user], true);
         let router = serve1(srv).await;
@@ -2121,6 +2124,7 @@ mod proxy_cov2 {
                 country: Some("us".into()),
                 ..Default::default()
             },
+            cost_per_byte: 1.0,
         }];
         // auth disabled so SOCKS5 uses no-auth, but still hits IP default selection.
         let srv = mk(proxies, None, None, vec![user], false);
