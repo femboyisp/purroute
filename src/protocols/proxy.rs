@@ -1476,6 +1476,40 @@ mod loopback {
         assert!(srv.resolve_proxy_chain(&sel_chain("nope")).is_err());
     }
 
+    /// `resolve_global_chain` fallback: when `router.chain` is `None`, the first
+    /// configured proxy is returned (backward-compatibility path).
+    #[test]
+    fn global_chain_falls_back_to_first_proxy_when_router_chain_unset() {
+        // `build(..., chain=None, ...)` leaves `router_cfg.chain = None`.
+        let srv = build(vec![dummy("first"), dummy("second")], None, None, vec![]);
+        let sel = crate::routing::Selection::default();
+        let got = srv.resolve_proxy_chain(&sel).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label.as_deref(), Some("first"));
+    }
+
+    /// `resolve_global_chain` error: no proxies configured returns an error.
+    #[test]
+    fn global_chain_no_proxies_errors() {
+        let srv = build(vec![], None, None, vec![]);
+        let sel = crate::routing::Selection::default();
+        assert!(srv.resolve_proxy_chain(&sel).is_err());
+    }
+
+    /// `resolve_ref` error: a chain references a proxy label that doesn't exist.
+    #[test]
+    fn chain_with_missing_proxy_label_errors() {
+        let chains = vec![ChainConfig {
+            chain_id: "broken".into(),
+            proxies: vec!["ghost".into()],
+            mode: crate::config::ChainMode::Strict,
+            count: None,
+        }];
+        // "ghost" is not in the proxy list → resolve_ref must error.
+        let srv = build(vec![dummy("real")], Some(chains), None, vec![]);
+        assert!(srv.resolve_proxy_chain(&sel_chain("broken")).is_err());
+    }
+
     /// Bind the router and serve exactly one accepted connection.
     async fn serve_once(srv: ProxyServer) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
