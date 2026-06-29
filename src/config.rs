@@ -277,4 +277,49 @@ mod tests {
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.proxy[0].cost_per_byte, 0.5);
     }
+
+    /// `get_upstream_addr` returns `address` bare when `port` is `None`.
+    #[test]
+    fn get_upstream_addr_no_port() {
+        let p = ProxyConfig {
+            label: None,
+            proxy_type: Protocol::Socks5,
+            address: "proxy.example.com".into(),
+            port: None,
+            username: None,
+            password: None,
+            tags: Tags {
+                country: None,
+                city: None,
+                isp: None,
+                kind: None,
+            },
+            cost_per_byte: 1.0,
+        };
+        assert_eq!(p.get_upstream_addr(), "proxy.example.com");
+    }
+
+    /// `Config::load` reads a TOML file from disk.
+    #[test]
+    fn load_reads_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("purroute-test-config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[router]
+listen = "127.0.0.1:1080"
+chain = "a"
+[[proxy]]
+label = "a"
+proxy_type = "Socks5"
+address = "10.0.0.1"
+port = 1080
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.proxy[0].address, "10.0.0.1");
+        let _ = std::fs::remove_file(&path);
+    }
 }

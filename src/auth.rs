@@ -630,4 +630,40 @@ mod auth_cov {
         // fractional cost rounds: 100 bytes at 0.005 => round(0.5) = 1 debit, remaining 699.
         assert_eq!(b.report_usage(1, 100, 0, 0.005).await.unwrap(), Some(699));
     }
+
+    /// Exercises the `AuthBackend` trait's default `authenticate_by_ip` — which
+    /// always returns `Ok(None)` — by using a minimal no-override implementor.
+    #[tokio::test]
+    async fn trait_default_ip_auth_returns_none() {
+        struct AlwaysDeny;
+        #[async_trait]
+        impl AuthBackend for AlwaysDeny {
+            async fn authenticate(
+                &self,
+                _username: &str,
+                _secret: &str,
+            ) -> Result<Option<Account>, AuthError> {
+                Ok(None)
+            }
+            async fn report_usage(
+                &self,
+                _id: i64,
+                _bytes_in: u64,
+                _bytes_out: u64,
+                _cost_per_byte: f64,
+            ) -> Result<Option<i64>, AuthError> {
+                Ok(None)
+            }
+        }
+        let b = AlwaysDeny;
+        // The default implementation returns Ok(None) regardless of IP.
+        let result = b
+            .authenticate_by_ip("127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        // Also exercise the other required methods so their bodies are counted.
+        assert!(b.authenticate("u", "p").await.unwrap().is_none());
+        assert!(b.report_usage(1, 0, 0, 1.0).await.unwrap().is_none());
+    }
 }
