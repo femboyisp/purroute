@@ -21,6 +21,7 @@ mod protocol;
 mod protocols;
 mod routing;
 mod stats;
+mod upstreams;
 
 use crate::{
     auth::{AuthBackend, PostgresAuthBackend, StaticAuthBackend},

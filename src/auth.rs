@@ -148,6 +148,27 @@ impl PostgresAuthBackend {
 
                 CREATE INDEX IF NOT EXISTS idx_accounts_username ON public.accounts(username);
                 CREATE INDEX IF NOT EXISTS idx_user_stats_id ON public.user_stats(id);
+
+                CREATE TABLE IF NOT EXISTS public.upstreams (
+                    id BIGSERIAL PRIMARY KEY,
+                    product_id TEXT,
+                    label TEXT,
+                    proxy_type TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    port INTEGER,
+                    username TEXT,
+                    password TEXT,
+                    country TEXT,
+                    city TEXT,
+                    isp TEXT,
+                    kind TEXT,
+                    cost_per_byte DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                    mode TEXT,
+                    enabled BOOLEAN NOT NULL DEFAULT true,
+                    expires_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                );
+                CREATE INDEX IF NOT EXISTS idx_upstreams_enabled ON public.upstreams(enabled);
                 ",
             )
             .await
