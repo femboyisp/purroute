@@ -270,6 +270,7 @@ mod socks4_cov {
             username: None,
             password: None,
             tags: Default::default(),
+            cost_per_byte: 1.0,
         }
     }
 
@@ -512,6 +513,7 @@ mod socks4_cov2 {
             username: user.map(str::to_string),
             password: pass.map(str::to_string),
             tags: Default::default(),
+            cost_per_byte: 1.0,
         }
     }
 

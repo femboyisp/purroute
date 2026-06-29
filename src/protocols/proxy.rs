@@ -12,6 +12,7 @@ use crate::{
     protocols::{ChainConnector, Http, Https, Socks4},
     stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
+use arc_swap::ArcSwap;
 use base64::Engine;
 use std::{net::SocketAddr, sync::Arc};
 use thiserror::Error;
@@ -40,7 +41,7 @@ pub enum ProxyError {
 
 #[derive(Clone)]
 pub struct ProxyServer {
-    proxy: Arc<Vec<ProxyConfig>>,
+    proxy: Arc<ArcSwap<Vec<ProxyConfig>>>,
     chains: Arc<Option<Vec<ChainConfig>>>,
     config: Arc<RouterConfig>,
     auth: Arc<dyn AuthBackend>,
@@ -55,11 +56,20 @@ impl ProxyServer {
         auth: Arc<dyn AuthBackend>,
     ) -> Self {
         Self {
-            proxy: Arc::new(proxy),
+            proxy: Arc::new(ArcSwap::from_pointee(proxy)),
             chains: Arc::new(chains),
             config,
             auth,
         }
+    }
+
+    /// Replace the live upstream set with `static_upstreams` followed by
+    /// `dynamic`. Concurrent connections keep using the previous snapshot until
+    /// they finish (lock-free via arc-swap).
+    pub fn replace_upstreams(&self, static_upstreams: &[ProxyConfig], dynamic: Vec<ProxyConfig>) {
+        let mut merged = static_upstreams.to_vec();
+        merged.extend(dynamic);
+        self.proxy.store(Arc::new(merged));
     }
 
     /// Resolve the upstream chain for a connection, honouring a routing
@@ -76,8 +86,8 @@ impl ProxyServer {
         }
         if !selection.only_session() {
             // Filter upstreams by the selection's tags, then pick (sticky/rotate).
-            let candidates: Vec<ProxyConfig> = self
-                .proxy
+            let proxies = self.proxy.load();
+            let candidates: Vec<ProxyConfig> = proxies
                 .iter()
                 .filter(|p| selection.matches(&p.tags))
                 .cloned()
@@ -97,8 +107,8 @@ impl ProxyServer {
         if let Some(chain_ref) = &self.config.chain {
             return self.resolve_ref(chain_ref);
         }
-        let proxy = self
-            .proxy
+        let proxies = self.proxy.load();
+        let proxy = proxies
             .first()
             .ok_or_else(|| ProxyError::Protocol("No proxy configuration available".to_string()))?
             .clone();
@@ -109,8 +119,9 @@ impl ProxyServer {
     /// `[[chain]]` by id (applying its `ChainMode`). Errors if neither matches.
     /// Shared by the global default and explicit `chain` selections.
     fn resolve_ref(&self, name: &str) -> Result<Vec<ProxyConfig>, ProxyError> {
+        let proxies = self.proxy.load();
         // First, try a single proxy by label.
-        if let Some(proxy) = self.proxy.iter().find(|p| p.label.as_deref() == Some(name)) {
+        if let Some(proxy) = proxies.iter().find(|p| p.label.as_deref() == Some(name)) {
             return Ok(vec![proxy.clone()]);
         }
 
@@ -120,8 +131,7 @@ impl ProxyServer {
                 // Collect the chain's proxies by label.
                 let mut proxy_configs = Vec::new();
                 for label in &chain.proxies {
-                    let proxy = self
-                        .proxy
+                    let proxy = proxies
                         .iter()
                         .find(|p| p.label.as_deref() == Some(label))
                         .ok_or_else(|| {
@@ -343,6 +353,7 @@ impl ProxyServer {
 
         // Resolve the upstream by the selection (single- or multi-hop), then tunnel.
         let proxy_chain = self.resolve_proxy_chain(&selection)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
         metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -359,8 +370,15 @@ impl ProxyServer {
         );
 
         // Relay data between client and upstream
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     /// Multi-hop SOCKS4/4a: parse the inbound CONNECT request, tunnel through
@@ -378,6 +396,7 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_socks4_target(&initial_request)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -392,8 +411,15 @@ impl ProxyServer {
             format!("SOCKS4 chain connection successful for {peer_addr}"),
             &self.config,
         );
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     /// Multi-hop HTTPS (CONNECT) tunnel through the chain.
@@ -410,6 +436,7 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_connect_target(&initial_request)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -423,8 +450,15 @@ impl ProxyServer {
             format!("HTTPS chain connection successful for {peer_addr}"),
             &self.config,
         );
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     /// Multi-hop plain HTTP: tunnel to the origin through the chain, then
@@ -442,6 +476,7 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_http_target(&initial_request)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let mut upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -458,11 +493,18 @@ impl ProxyServer {
             format!("HTTP chain connection successful for {peer_addr}"),
             &self.config,
         );
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
-    pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
+    pub async fn run(&self, addr: SocketAddr) -> Result<(), ProxyError> {
         let listener = TcpListener::bind(addr).await?;
         let global_stats = get_global_stats();
         global_stats.log_info(format!("Proxy server listening on {}", addr), &self.config);
@@ -476,7 +518,11 @@ impl ProxyServer {
             global_stats.log_info(format!("New connection from {}", peer_addr), &self.config);
 
             let server = self.clone();
-            let label = server.proxy.first().and_then(|config| config.label.clone());
+            let label = server
+                .proxy
+                .load()
+                .first()
+                .and_then(|config| config.label.clone());
             tokio::spawn(async move {
                 if let Err(e) = server.handle_connection(socket, peer_addr, label).await {
                     global_stats.record_connection_result(
@@ -555,6 +601,7 @@ impl ProxyServer {
                 // `ChainConnector`, then relays. Single-hop keeps the existing
                 // per-protocol translation handlers.
                 let multi_hop = proxy_chain.len() > 1;
+                let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
                 match protocol {
                     // SOCKS5 resolves its own upstream after auth (its username,
@@ -617,7 +664,14 @@ impl ProxyServer {
                                         &server.config,
                                     );
                                     server
-                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .proxy_data(
+                                            client,
+                                            upstream,
+                                            peer,
+                                            stats,
+                                            user_account,
+                                            cost_per_byte,
+                                        )
                                         .await
                                 })
                             },
@@ -644,7 +698,14 @@ impl ProxyServer {
                                         &server.config,
                                     );
                                     server
-                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .proxy_data(
+                                            client,
+                                            upstream,
+                                            peer,
+                                            stats,
+                                            user_account,
+                                            cost_per_byte,
+                                        )
                                         .await
                                 })
                             },
@@ -671,7 +732,14 @@ impl ProxyServer {
                                         &server.config,
                                     );
                                     server
-                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .proxy_data(
+                                            client,
+                                            upstream,
+                                            peer,
+                                            stats,
+                                            user_account,
+                                            cost_per_byte,
+                                        )
                                         .await
                                 })
                             },
@@ -822,6 +890,7 @@ impl ProxyServer {
         peer_addr: SocketAddr,
         stats: Arc<GlobalStats>,
         id: Option<i64>,
+        cost_per_byte: f64,
     ) -> Result<(), ProxyError> {
         let (mut client_reader, mut client_writer) = client.split();
         let (mut upstream_reader, mut upstream_writer) = upstream.split();
@@ -841,7 +910,7 @@ impl ProxyServer {
                         if let Some(id) = id {
                             let remaining = self
                                 .auth
-                                .report_usage(id, 0, as_u64(n))
+                                .report_usage(id, 0, as_u64(n), cost_per_byte)
                                 .await
                                 .map_err(auth_io_error)?;
                             // Mid-stream cut-off: stop once the allowance is spent,
@@ -892,7 +961,7 @@ impl ProxyServer {
                         if let Some(id) = id {
                             let remaining = self
                                 .auth
-                                .report_usage(id, as_u64(n), 0)
+                                .report_usage(id, as_u64(n), 0, cost_per_byte)
                                 .await
                                 .map_err(auth_io_error)?;
                             // Mid-stream cut-off: stop once the allowance is spent,
@@ -1271,6 +1340,7 @@ mod loopback {
             username: None,
             password: None,
             tags,
+            cost_per_byte: 1.0,
         }
     }
 
@@ -1303,6 +1373,7 @@ mod loopback {
             debug: Some(false),
             auth: Some(auth),
             metrics_listen: None,
+            upstream_refresh_secs: None,
         })
     }
 
@@ -1341,6 +1412,18 @@ mod loopback {
             "127.0.0.1:1".parse().unwrap(),
             Tags::default(),
         )
+    }
+
+    #[test]
+    fn replace_upstreams_swaps_the_live_set() {
+        let srv = build(vec![dummy("static-a")], None, None, vec![]);
+        // Initially only the static upstream resolves.
+        assert!(srv.resolve_proxy_chain(&sel_chain("static-a")).is_ok());
+        assert!(srv.resolve_proxy_chain(&sel_chain("dyn-b")).is_err());
+        // Swap in a dynamic upstream alongside the static one.
+        srv.replace_upstreams(&[dummy("static-a")], vec![dummy("dyn-b")]);
+        assert!(srv.resolve_proxy_chain(&sel_chain("static-a")).is_ok());
+        assert!(srv.resolve_proxy_chain(&sel_chain("dyn-b")).is_ok());
     }
 
     #[test]
@@ -1391,6 +1474,40 @@ mod loopback {
     fn chain_selection_unknown_name_errors() {
         let srv = build(vec![dummy("a")], None, None, vec![]);
         assert!(srv.resolve_proxy_chain(&sel_chain("nope")).is_err());
+    }
+
+    /// `resolve_global_chain` fallback: when `router.chain` is `None`, the first
+    /// configured proxy is returned (backward-compatibility path).
+    #[test]
+    fn global_chain_falls_back_to_first_proxy_when_router_chain_unset() {
+        // `build(..., chain=None, ...)` leaves `router_cfg.chain = None`.
+        let srv = build(vec![dummy("first"), dummy("second")], None, None, vec![]);
+        let sel = crate::routing::Selection::default();
+        let got = srv.resolve_proxy_chain(&sel).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label.as_deref(), Some("first"));
+    }
+
+    /// `resolve_global_chain` error: no proxies configured returns an error.
+    #[test]
+    fn global_chain_no_proxies_errors() {
+        let srv = build(vec![], None, None, vec![]);
+        let sel = crate::routing::Selection::default();
+        assert!(srv.resolve_proxy_chain(&sel).is_err());
+    }
+
+    /// `resolve_ref` error: a chain references a proxy label that doesn't exist.
+    #[test]
+    fn chain_with_missing_proxy_label_errors() {
+        let chains = vec![ChainConfig {
+            chain_id: "broken".into(),
+            proxies: vec!["ghost".into()],
+            mode: crate::config::ChainMode::Strict,
+            count: None,
+        }];
+        // "ghost" is not in the proxy list → resolve_ref must error.
+        let srv = build(vec![dummy("real")], Some(chains), None, vec![]);
+        assert!(srv.resolve_proxy_chain(&sel_chain("broken")).is_err());
     }
 
     /// Bind the router and serve exactly one accepted connection.
@@ -1685,6 +1802,42 @@ mod loopback {
     }
 
     #[tokio::test]
+    async fn metering_scales_by_upstream_cost() {
+        // Upstream costs 1000 value-units/byte, so even a tiny transfer blows a
+        // small allowance: the body must not come through.
+        let up = fake_socks5_upstream(BODY).await;
+        let mut p = proxy("up", Proxy::Socks5, up, Tags::default());
+        p.cost_per_byte = 1000.0;
+        let srv = build(
+            vec![p],
+            None,
+            Some("up"),
+            vec![user_limited("me", "pw", 50)],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        c.write_all(&[0x01, 2, b'm', b'e', 2, b'p', b'w'])
+            .await
+            .unwrap();
+        let mut ar = [0u8; 2];
+        c.read_exact(&mut ar).await.unwrap();
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(!read_body(&mut c).await.contains(BODY));
+    }
+
+    #[tokio::test]
     async fn socks4_inbound_through_socks4_upstream() {
         let up = fake_socks4_upstream(BODY).await;
         let srv = build(
@@ -1829,6 +1982,7 @@ mod proxy_cov2 {
             username: None,
             password: None,
             tags: Tags::default(),
+            cost_per_byte: 1.0,
         }
     }
 
@@ -1851,6 +2005,7 @@ mod proxy_cov2 {
             debug: Some(false),
             auth: Some(auth),
             metrics_listen: None,
+            upstream_refresh_secs: None,
         })
     }
 
@@ -2091,6 +2246,7 @@ mod proxy_cov2 {
                 country: Some("us".into()),
                 ..Default::default()
             },
+            cost_per_byte: 1.0,
         }];
         let srv = mk(proxies, None, None, vec![user], true);
         let router = serve1(srv).await;
@@ -2121,6 +2277,7 @@ mod proxy_cov2 {
                 country: Some("us".into()),
                 ..Default::default()
             },
+            cost_per_byte: 1.0,
         }];
         // auth disabled so SOCKS5 uses no-auth, but still hits IP default selection.
         let srv = mk(proxies, None, None, vec![user], false);
