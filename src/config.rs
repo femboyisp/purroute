@@ -62,6 +62,10 @@ pub struct RouterConfig {
     pub auth: Option<bool>,
     /// Optional local-only address for the Prometheus `/metrics` endpoint.
     pub metrics_listen: Option<String>,
+    /// How often (in seconds) to re-fetch upstreams from the database and
+    /// merge them with the static config set. Defaults to 30 when a database
+    /// is configured; ignored when running database-less.
+    pub upstream_refresh_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]

@@ -234,6 +234,7 @@ mod stats_cov {
             debug: Some(debug),
             auth: None,
             metrics_listen: None,
+            upstream_refresh_secs: None,
         }
     }
 
@@ -431,6 +432,7 @@ mod stats_cov2 {
             debug: Some(debug),
             auth: None,
             metrics_listen: None,
+            upstream_refresh_secs: None,
         }
     }
 

@@ -88,13 +88,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let router_config_clone = router_config.clone();
 
-    let server = ProxyServer::new(
+    // Keep the static upstreams so the refresh task can prepend them.
+    let static_proxies = proxies.clone();
+
+    let server = Arc::new(ProxyServer::new(
         proxies,
         chains,
         Arc::clone(&stats_display),
         Arc::new(router_config.clone()),
         auth_backend,
-    );
+    ));
+
+    // When a database is configured, do an initial upstream load and then
+    // spawn a background task that periodically refreshes them.
+    if let Some(client) = db_client.clone() {
+        let server_for_refresh = Arc::clone(&server);
+        let static_upstreams = static_proxies.clone();
+        // Initial load: apply dynamic upstreams immediately at startup.
+        if let Ok(dynamic) = crate::upstreams::load_dynamic_upstreams(&client).await {
+            server_for_refresh.replace_upstreams(&static_upstreams, dynamic);
+        }
+        let interval = router_config.upstream_refresh_secs.unwrap_or(30);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+            loop {
+                tick.tick().await;
+                match crate::upstreams::load_dynamic_upstreams(&client).await {
+                    Ok(dynamic) => {
+                        server_for_refresh.replace_upstreams(&static_upstreams, dynamic);
+                    }
+                    Err(e) => eprintln!("upstream refresh failed: {e}"),
+                }
+            }
+        });
+    }
 
     // Run the stats display in a separate task.
     let display_handle = tokio::spawn({
@@ -119,7 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Run the proxy server (blocks).
+    // Run the proxy server (blocks). `run` takes `&self` so we can share the
+    // Arc with the refresh task above.
     server.run(router_config.listen.parse()?).await?;
 
     display_handle.await?;
