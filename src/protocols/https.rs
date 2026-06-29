@@ -241,6 +241,7 @@ mod https_cov {
             username: user.map(|(u, _)| u.to_owned()),
             password: user.map(|(_, p)| p.to_owned()),
             tags: Tags::default(),
+            cost_per_byte: 1.0,
         }
     }
 

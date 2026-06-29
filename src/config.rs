@@ -62,6 +62,10 @@ pub struct RouterConfig {
     pub auth: Option<bool>,
     /// Optional local-only address for the Prometheus `/metrics` endpoint.
     pub metrics_listen: Option<String>,
+    /// How often (in seconds) to re-fetch upstreams from the database and
+    /// merge them with the static config set. Defaults to 30 when a database
+    /// is configured; ignored when running database-less.
+    pub upstream_refresh_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -106,6 +110,15 @@ pub struct ProxyConfig {
     pub password: Option<String>,
     #[serde(flatten)]
     pub tags: Tags,
+    /// Abstract metering rate: value units debited per relayed byte. `1.0`
+    /// (the default) means one value unit per byte — i.e. plain byte metering.
+    #[serde(default = "default_cost_per_byte")]
+    #[allow(clippy::allow_attributes, dead_code)]
+    pub cost_per_byte: f64,
+}
+
+fn default_cost_per_byte() -> f64 {
+    1.0
 }
 
 impl ProxyConfig {
@@ -234,5 +247,79 @@ mod tests {
     #[test]
     fn encode_auth_is_base64() {
         assert_eq!(encode_auth("user", "pass"), "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn proxy_cost_per_byte_defaults_to_one() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "a"
+            proxy_type = "Socks5"
+            address = "127.0.0.1:9000"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.proxy[0].cost_per_byte, 1.0);
+    }
+
+    #[test]
+    fn proxy_cost_per_byte_parses_when_set() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "a"
+            proxy_type = "Socks5"
+            address = "127.0.0.1:9000"
+            cost_per_byte = 0.5
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.proxy[0].cost_per_byte, 0.5);
+    }
+
+    /// `get_upstream_addr` returns `address` bare when `port` is `None`.
+    #[test]
+    fn get_upstream_addr_no_port() {
+        let p = ProxyConfig {
+            label: None,
+            proxy_type: Protocol::Socks5,
+            address: "proxy.example.com".into(),
+            port: None,
+            username: None,
+            password: None,
+            tags: Tags {
+                country: None,
+                city: None,
+                isp: None,
+                kind: None,
+            },
+            cost_per_byte: 1.0,
+        };
+        assert_eq!(p.get_upstream_addr(), "proxy.example.com");
+    }
+
+    /// `Config::load` reads a TOML file from disk.
+    #[test]
+    fn load_reads_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("purroute-test-config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[router]
+listen = "127.0.0.1:1080"
+chain = "a"
+[[proxy]]
+label = "a"
+proxy_type = "Socks5"
+address = "10.0.0.1"
+port = 1080
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.proxy[0].address, "10.0.0.1");
+        let _ = std::fs::remove_file(&path);
     }
 }
