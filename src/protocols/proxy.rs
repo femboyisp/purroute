@@ -343,6 +343,7 @@ impl ProxyServer {
 
         // Resolve the upstream by the selection (single- or multi-hop), then tunnel.
         let proxy_chain = self.resolve_proxy_chain(&selection)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
         metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -359,8 +360,15 @@ impl ProxyServer {
         );
 
         // Relay data between client and upstream
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     /// Multi-hop SOCKS4/4a: parse the inbound CONNECT request, tunnel through
@@ -378,6 +386,7 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_socks4_target(&initial_request)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -392,8 +401,15 @@ impl ProxyServer {
             format!("SOCKS4 chain connection successful for {peer_addr}"),
             &self.config,
         );
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     /// Multi-hop HTTPS (CONNECT) tunnel through the chain.
@@ -410,6 +426,7 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_connect_target(&initial_request)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -423,8 +440,15 @@ impl ProxyServer {
             format!("HTTPS chain connection successful for {peer_addr}"),
             &self.config,
         );
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     /// Multi-hop plain HTTP: tunnel to the origin through the chain, then
@@ -442,6 +466,7 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_http_target(&initial_request)?;
+        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let mut upstream =
             ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
@@ -458,8 +483,15 @@ impl ProxyServer {
             format!("HTTP chain connection successful for {peer_addr}"),
             &self.config,
         );
-        self.proxy_data(client, upstream, peer_addr, global_stats, user_account)
-            .await
+        self.proxy_data(
+            client,
+            upstream,
+            peer_addr,
+            global_stats,
+            user_account,
+            cost_per_byte,
+        )
+        .await
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
@@ -555,6 +587,7 @@ impl ProxyServer {
                 // `ChainConnector`, then relays. Single-hop keeps the existing
                 // per-protocol translation handlers.
                 let multi_hop = proxy_chain.len() > 1;
+                let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
                 match protocol {
                     // SOCKS5 resolves its own upstream after auth (its username,
@@ -617,7 +650,14 @@ impl ProxyServer {
                                         &server.config,
                                     );
                                     server
-                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .proxy_data(
+                                            client,
+                                            upstream,
+                                            peer,
+                                            stats,
+                                            user_account,
+                                            cost_per_byte,
+                                        )
                                         .await
                                 })
                             },
@@ -644,7 +684,14 @@ impl ProxyServer {
                                         &server.config,
                                     );
                                     server
-                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .proxy_data(
+                                            client,
+                                            upstream,
+                                            peer,
+                                            stats,
+                                            user_account,
+                                            cost_per_byte,
+                                        )
                                         .await
                                 })
                             },
@@ -671,7 +718,14 @@ impl ProxyServer {
                                         &server.config,
                                     );
                                     server
-                                        .proxy_data(client, upstream, peer, stats, user_account)
+                                        .proxy_data(
+                                            client,
+                                            upstream,
+                                            peer,
+                                            stats,
+                                            user_account,
+                                            cost_per_byte,
+                                        )
                                         .await
                                 })
                             },
@@ -822,6 +876,7 @@ impl ProxyServer {
         peer_addr: SocketAddr,
         stats: Arc<GlobalStats>,
         id: Option<i64>,
+        cost_per_byte: f64,
     ) -> Result<(), ProxyError> {
         let (mut client_reader, mut client_writer) = client.split();
         let (mut upstream_reader, mut upstream_writer) = upstream.split();
@@ -841,7 +896,7 @@ impl ProxyServer {
                         if let Some(id) = id {
                             let remaining = self
                                 .auth
-                                .report_usage(id, 0, as_u64(n), 1.0)
+                                .report_usage(id, 0, as_u64(n), cost_per_byte)
                                 .await
                                 .map_err(auth_io_error)?;
                             // Mid-stream cut-off: stop once the allowance is spent,
@@ -892,7 +947,7 @@ impl ProxyServer {
                         if let Some(id) = id {
                             let remaining = self
                                 .auth
-                                .report_usage(id, as_u64(n), 0, 1.0)
+                                .report_usage(id, as_u64(n), 0, cost_per_byte)
                                 .await
                                 .map_err(auth_io_error)?;
                             // Mid-stream cut-off: stop once the allowance is spent,
@@ -1682,6 +1737,42 @@ mod loopback {
             .await
             .unwrap();
         // Allowance exhausted: the proxied body must not come through.
+        assert!(!read_body(&mut c).await.contains(BODY));
+    }
+
+    #[tokio::test]
+    async fn metering_scales_by_upstream_cost() {
+        // Upstream costs 1000 value-units/byte, so even a tiny transfer blows a
+        // small allowance: the body must not come through.
+        let up = fake_socks5_upstream(BODY).await;
+        let mut p = proxy("up", Proxy::Socks5, up, Tags::default());
+        p.cost_per_byte = 1000.0;
+        let srv = build(
+            vec![p],
+            None,
+            Some("up"),
+            vec![user_limited("me", "pw", 50)],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        c.write_all(&[0x01, 2, b'm', b'e', 2, b'p', b'w'])
+            .await
+            .unwrap();
+        let mut ar = [0u8; 2];
+        c.read_exact(&mut ar).await.unwrap();
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
         assert!(!read_body(&mut c).await.contains(BODY));
     }
 
