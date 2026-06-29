@@ -12,6 +12,7 @@ use crate::{
     protocols::{ChainConnector, Http, Https, Socks4},
     stats::{get_global_stats, GlobalStats, StatsDisplay},
 };
+use arc_swap::ArcSwap;
 use base64::Engine;
 use std::{net::SocketAddr, sync::Arc};
 use thiserror::Error;
@@ -40,7 +41,7 @@ pub enum ProxyError {
 
 #[derive(Clone)]
 pub struct ProxyServer {
-    proxy: Arc<Vec<ProxyConfig>>,
+    proxy: Arc<ArcSwap<Vec<ProxyConfig>>>,
     chains: Arc<Option<Vec<ChainConfig>>>,
     config: Arc<RouterConfig>,
     auth: Arc<dyn AuthBackend>,
@@ -55,11 +56,20 @@ impl ProxyServer {
         auth: Arc<dyn AuthBackend>,
     ) -> Self {
         Self {
-            proxy: Arc::new(proxy),
+            proxy: Arc::new(ArcSwap::from_pointee(proxy)),
             chains: Arc::new(chains),
             config,
             auth,
         }
+    }
+
+    /// Replace the live upstream set with `static_upstreams` followed by
+    /// `dynamic`. Concurrent connections keep using the previous snapshot until
+    /// they finish (lock-free via arc-swap).
+    pub fn replace_upstreams(&self, static_upstreams: &[ProxyConfig], dynamic: Vec<ProxyConfig>) {
+        let mut merged = static_upstreams.to_vec();
+        merged.extend(dynamic);
+        self.proxy.store(Arc::new(merged));
     }
 
     /// Resolve the upstream chain for a connection, honouring a routing
@@ -76,8 +86,8 @@ impl ProxyServer {
         }
         if !selection.only_session() {
             // Filter upstreams by the selection's tags, then pick (sticky/rotate).
-            let candidates: Vec<ProxyConfig> = self
-                .proxy
+            let proxies = self.proxy.load();
+            let candidates: Vec<ProxyConfig> = proxies
                 .iter()
                 .filter(|p| selection.matches(&p.tags))
                 .cloned()
@@ -97,8 +107,8 @@ impl ProxyServer {
         if let Some(chain_ref) = &self.config.chain {
             return self.resolve_ref(chain_ref);
         }
-        let proxy = self
-            .proxy
+        let proxies = self.proxy.load();
+        let proxy = proxies
             .first()
             .ok_or_else(|| ProxyError::Protocol("No proxy configuration available".to_string()))?
             .clone();
@@ -109,8 +119,9 @@ impl ProxyServer {
     /// `[[chain]]` by id (applying its `ChainMode`). Errors if neither matches.
     /// Shared by the global default and explicit `chain` selections.
     fn resolve_ref(&self, name: &str) -> Result<Vec<ProxyConfig>, ProxyError> {
+        let proxies = self.proxy.load();
         // First, try a single proxy by label.
-        if let Some(proxy) = self.proxy.iter().find(|p| p.label.as_deref() == Some(name)) {
+        if let Some(proxy) = proxies.iter().find(|p| p.label.as_deref() == Some(name)) {
             return Ok(vec![proxy.clone()]);
         }
 
@@ -120,8 +131,7 @@ impl ProxyServer {
                 // Collect the chain's proxies by label.
                 let mut proxy_configs = Vec::new();
                 for label in &chain.proxies {
-                    let proxy = self
-                        .proxy
+                    let proxy = proxies
                         .iter()
                         .find(|p| p.label.as_deref() == Some(label))
                         .ok_or_else(|| {
@@ -494,7 +504,7 @@ impl ProxyServer {
         .await
     }
 
-    pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
+    pub async fn run(&self, addr: SocketAddr) -> Result<(), ProxyError> {
         let listener = TcpListener::bind(addr).await?;
         let global_stats = get_global_stats();
         global_stats.log_info(format!("Proxy server listening on {}", addr), &self.config);
@@ -508,7 +518,11 @@ impl ProxyServer {
             global_stats.log_info(format!("New connection from {}", peer_addr), &self.config);
 
             let server = self.clone();
-            let label = server.proxy.first().and_then(|config| config.label.clone());
+            let label = server
+                .proxy
+                .load()
+                .first()
+                .and_then(|config| config.label.clone());
             tokio::spawn(async move {
                 if let Err(e) = server.handle_connection(socket, peer_addr, label).await {
                     global_stats.record_connection_result(
@@ -1359,6 +1373,7 @@ mod loopback {
             debug: Some(false),
             auth: Some(auth),
             metrics_listen: None,
+            upstream_refresh_secs: None,
         })
     }
 
@@ -1397,6 +1412,18 @@ mod loopback {
             "127.0.0.1:1".parse().unwrap(),
             Tags::default(),
         )
+    }
+
+    #[test]
+    fn replace_upstreams_swaps_the_live_set() {
+        let srv = build(vec![dummy("static-a")], None, None, vec![]);
+        // Initially only the static upstream resolves.
+        assert!(srv.resolve_proxy_chain(&sel_chain("static-a")).is_ok());
+        assert!(srv.resolve_proxy_chain(&sel_chain("dyn-b")).is_err());
+        // Swap in a dynamic upstream alongside the static one.
+        srv.replace_upstreams(&[dummy("static-a")], vec![dummy("dyn-b")]);
+        assert!(srv.resolve_proxy_chain(&sel_chain("static-a")).is_ok());
+        assert!(srv.resolve_proxy_chain(&sel_chain("dyn-b")).is_ok());
     }
 
     #[test]
@@ -1944,6 +1971,7 @@ mod proxy_cov2 {
             debug: Some(false),
             auth: Some(auth),
             metrics_listen: None,
+            upstream_refresh_secs: None,
         })
     }
 
