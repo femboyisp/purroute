@@ -299,9 +299,9 @@ mod tests {
             None,
             None,
             None,
-            3.14,
+            2.5,
         );
-        assert!((p.cost_per_byte - 3.14).abs() < f64::EPSILON);
+        assert!((p.cost_per_byte - 2.5).abs() < f64::EPSILON);
     }
 
     /// DB-gated: inserts one row and verifies `load_dynamic_upstreams` round-trips
