@@ -106,6 +106,15 @@ pub struct ProxyConfig {
     pub password: Option<String>,
     #[serde(flatten)]
     pub tags: Tags,
+    /// Abstract metering rate: value units debited per relayed byte. `1.0`
+    /// (the default) means one value unit per byte — i.e. plain byte metering.
+    #[serde(default = "default_cost_per_byte")]
+    #[allow(clippy::allow_attributes, dead_code)]
+    pub cost_per_byte: f64,
+}
+
+fn default_cost_per_byte() -> f64 {
+    1.0
 }
 
 impl ProxyConfig {
@@ -234,5 +243,34 @@ mod tests {
     #[test]
     fn encode_auth_is_base64() {
         assert_eq!(encode_auth("user", "pass"), "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn proxy_cost_per_byte_defaults_to_one() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "a"
+            proxy_type = "Socks5"
+            address = "127.0.0.1:9000"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.proxy[0].cost_per_byte, 1.0);
+    }
+
+    #[test]
+    fn proxy_cost_per_byte_parses_when_set() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "a"
+            proxy_type = "Socks5"
+            address = "127.0.0.1:9000"
+            cost_per_byte = 0.5
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.proxy[0].cost_per_byte, 0.5);
     }
 }
