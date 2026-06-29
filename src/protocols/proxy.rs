@@ -1284,6 +1284,16 @@ mod loopback {
         }
     }
 
+    fn user_limited(name: &str, pass: &str, limit: i64) -> UserConfig {
+        UserConfig {
+            username: name.to_owned(),
+            password: pass.to_owned(),
+            bandwidth_limit: Some(limit),
+            allowed_ips: Vec::new(),
+            default_selection: None,
+        }
+    }
+
     fn router_cfg(chain: Option<&str>, auth: bool) -> Arc<RouterConfig> {
         Arc::new(RouterConfig {
             listen: "127.0.0.1:0".into(),
@@ -1315,6 +1325,72 @@ mod loopback {
             router_cfg(chain, !users.is_empty()),
             auth,
         )
+    }
+
+    fn sel_chain(name: &str) -> crate::routing::Selection {
+        crate::routing::Selection {
+            chain: Some(name.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn dummy(label: &str) -> ProxyConfig {
+        proxy(
+            label,
+            Proxy::Socks5,
+            "127.0.0.1:1".parse().unwrap(),
+            Tags::default(),
+        )
+    }
+
+    #[test]
+    fn chain_selection_resolves_a_proxy_label() {
+        let srv = build(vec![dummy("a"), dummy("b")], None, None, vec![]);
+        let got = srv.resolve_proxy_chain(&sel_chain("b")).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn chain_selection_resolves_a_chain_id_in_order() {
+        let chains = vec![ChainConfig {
+            chain_id: "circuit".into(),
+            proxies: vec!["a".into(), "b".into()],
+            mode: crate::config::ChainMode::Strict,
+            count: None,
+        }];
+        let srv = build(vec![dummy("a"), dummy("b")], Some(chains), None, vec![]);
+        let got = srv.resolve_proxy_chain(&sel_chain("circuit")).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|p| p.label.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn chain_selection_random_picks_count() {
+        let chains = vec![ChainConfig {
+            chain_id: "rnd".into(),
+            proxies: vec!["a".into(), "b".into(), "c".into()],
+            mode: crate::config::ChainMode::Random,
+            count: Some(2),
+        }];
+        let srv = build(
+            vec![dummy("a"), dummy("b"), dummy("c")],
+            Some(chains),
+            None,
+            vec![],
+        );
+        let got = srv.resolve_proxy_chain(&sel_chain("rnd")).unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn chain_selection_unknown_name_errors() {
+        let srv = build(vec![dummy("a")], None, None, vec![]);
+        assert!(srv.resolve_proxy_chain(&sel_chain("nope")).is_err());
     }
 
     /// Bind the router and serve exactly one accepted connection.
@@ -1568,6 +1644,44 @@ mod loopback {
         let mut ar = [0u8; 2];
         let r = c.read_exact(&mut ar).await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_stops_when_bandwidth_is_exhausted() {
+        // A tiny allowance is spent on the first relayed chunk, so the request
+        // never reaches the upstream and the body never comes back: the
+        // connection is cut mid-stream rather than draining far past zero.
+        let up = fake_socks5_upstream(BODY).await;
+        let srv = build(
+            vec![proxy("up", Proxy::Socks5, up, Tags::default())],
+            None,
+            Some("up"),
+            vec![user_limited("me", "pw", 5)],
+        );
+        let router = serve_once(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        c.write_all(&[0x01, 2, b'm', b'e', 2, b'p', b'w'])
+            .await
+            .unwrap();
+        let mut ar = [0u8; 2];
+        c.read_exact(&mut ar).await.unwrap();
+        assert_eq!(ar, [0x01, 0x00]);
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00); // CONNECT succeeded before the cut-off
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        // Allowance exhausted: the proxied body must not come through.
+        assert!(!read_body(&mut c).await.contains(BODY));
     }
 
     #[tokio::test]
