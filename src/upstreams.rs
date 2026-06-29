@@ -73,8 +73,100 @@ mod tests {
     #[test]
     fn protocol_strings_map() {
         assert_eq!(protocol_from_str("http"), Protocol::Http);
+        assert_eq!(protocol_from_str("https"), Protocol::Https);
         assert_eq!(protocol_from_str("SOCKS5"), Protocol::Socks5);
         assert_eq!(protocol_from_str("socks4"), Protocol::Socks4);
         assert_eq!(protocol_from_str("weird"), Protocol::Socks5);
+    }
+
+    /// DB-gated integration test: inserts one row into `public.upstreams` and
+    /// asserts that `load_dynamic_upstreams` returns a `ProxyConfig` with the
+    /// expected fields. Skips cleanly when `TEST_DATABASE_URL` is absent or when
+    /// the database is unreachable.
+    ///
+    /// To run locally: `TEST_DATABASE_URL="host=localhost port=5432 user=purroute
+    /// dbname=purroute password=purroute" cargo test -p purroute --bins`
+    #[tokio::test]
+    async fn load_dynamic_upstreams_roundtrip() {
+        let url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("load_dynamic_upstreams_roundtrip: no TEST_DATABASE_URL — skipping");
+                return;
+            }
+        };
+
+        let (client, connection) = match tokio_postgres::connect(&url, tokio_postgres::NoTls).await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("load_dynamic_upstreams_roundtrip: DB unreachable ({e}) — skipping");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("load_dynamic_upstreams_roundtrip: connection error: {e}");
+            }
+        });
+
+        // Ensure the schema exists (idempotent).
+        crate::auth::PostgresAuthBackend::initialize_schema(&client)
+            .await
+            .expect("initialize_schema failed");
+
+        // Insert a test upstream row.
+        let inserted: i64 = client
+            .query_one(
+                "INSERT INTO public.upstreams \
+                     (label, proxy_type, address, port, username, password, \
+                      country, city, isp, kind, cost_per_byte, enabled) \
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) \
+                     RETURNING id",
+                &[
+                    &Some("test-label"),
+                    &"socks5",
+                    &"10.0.0.1",
+                    &Some(1080_i32),
+                    &Some("user"),
+                    &Some("pass"),
+                    &Some("us"),
+                    &Some("nyc"),
+                    &Some("comcast"),
+                    &Some("residential"),
+                    &2.5_f64,
+                ],
+            )
+            .await
+            .expect("INSERT failed")
+            .get(0);
+
+        // Call the function under test.
+        let proxies = load_dynamic_upstreams(&client)
+            .await
+            .expect("load_dynamic_upstreams failed");
+
+        // Clean up before asserting so we don't leave rows on failure.
+        client
+            .execute("DELETE FROM public.upstreams WHERE id = $1", &[&inserted])
+            .await
+            .expect("cleanup DELETE failed");
+
+        // Find our row (other tests may insert rows too).
+        let proxy = proxies
+            .into_iter()
+            .find(|p| p.label.as_deref() == Some("test-label"))
+            .expect("our upstream row was not returned by load_dynamic_upstreams");
+
+        assert_eq!(proxy.address, "10.0.0.1");
+        assert_eq!(proxy.port, Some(1080));
+        assert_eq!(proxy.username.as_deref(), Some("user"));
+        assert_eq!(proxy.password.as_deref(), Some("pass"));
+        assert_eq!(proxy.proxy_type, Protocol::Socks5);
+        assert_eq!(proxy.tags.country.as_deref(), Some("us"));
+        assert_eq!(proxy.tags.city.as_deref(), Some("nyc"));
+        assert_eq!(proxy.tags.isp.as_deref(), Some("comcast"));
+        assert_eq!(proxy.tags.kind.as_deref(), Some("residential"));
+        assert!((proxy.cost_per_byte - 2.5).abs() < f64::EPSILON);
     }
 }
