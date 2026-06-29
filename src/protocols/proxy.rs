@@ -841,7 +841,7 @@ impl ProxyServer {
                         if let Some(id) = id {
                             let remaining = self
                                 .auth
-                                .report_usage(id, 0, as_u64(n))
+                                .report_usage(id, 0, as_u64(n), 1.0)
                                 .await
                                 .map_err(auth_io_error)?;
                             // Mid-stream cut-off: stop once the allowance is spent,
@@ -892,7 +892,7 @@ impl ProxyServer {
                         if let Some(id) = id {
                             let remaining = self
                                 .auth
-                                .report_usage(id, as_u64(n), 0)
+                                .report_usage(id, as_u64(n), 0, 1.0)
                                 .await
                                 .map_err(auth_io_error)?;
                             // Mid-stream cut-off: stop once the allowance is spent,
