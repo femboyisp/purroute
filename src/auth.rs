@@ -58,7 +58,17 @@ pub trait AuthBackend: Send + Sync {
     }
 
     /// Record relayed bytes for an account and decrement its allowance.
-    async fn report_usage(&self, id: i64, bytes_in: u64, bytes_out: u64) -> Result<(), AuthError>;
+    ///
+    /// Returns the account's remaining byte allowance *after* this debit:
+    /// `Some(remaining)` for a limited account (so the caller can cut a
+    /// connection mid-stream when it hits zero), or `None` for an unlimited
+    /// account or an unknown id (nothing to enforce).
+    async fn report_usage(
+        &self,
+        id: i64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> Result<Option<i64>, AuthError>;
 }
 
 /// Postgres-backed [`AuthBackend`] over a generic `accounts` / `user_stats`
@@ -195,28 +205,40 @@ impl AuthBackend for PostgresAuthBackend {
         }))
     }
 
-    async fn report_usage(&self, id: i64, bytes_in: u64, bytes_out: u64) -> Result<(), AuthError> {
+    async fn report_usage(
+        &self,
+        id: i64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> Result<Option<i64>, AuthError> {
         let bin = to_i64(bytes_in);
         let bout = to_i64(bytes_out);
-        self.client
-            .execute(
-                "UPDATE public.user_stats \
-                 SET total_bytes_in = total_bytes_in + $1, \
-                     total_bytes_out = total_bytes_out + $2 \
-                 WHERE id = $3",
-                &[&bin, &bout, &id],
+        let total = bin.saturating_add(bout);
+        // One statement so the stats bump and the balance debit are atomic (a
+        // data-modifying CTE runs exactly once, under a single snapshot). The
+        // debit only touches limited accounts: a NULL `bandwidth_limit` means
+        // unlimited and must never be turned into 0. `RETURNING` gives the new
+        // remaining balance so the caller can stop a connection mid-stream;
+        // unlimited / unknown accounts return no row -> `None` (nothing to cap).
+        let row = self
+            .client
+            .query_opt(
+                "WITH s AS ( \
+                     UPDATE public.user_stats \
+                     SET total_bytes_in = total_bytes_in + $1, \
+                         total_bytes_out = total_bytes_out + $2 \
+                     WHERE id = $3 \
+                     RETURNING 1 \
+                 ) \
+                 UPDATE public.accounts \
+                 SET bandwidth_limit = GREATEST(bandwidth_limit - $4, 0) \
+                 WHERE account = $3 AND bandwidth_limit IS NOT NULL \
+                 RETURNING bandwidth_limit",
+                &[&bin, &bout, &id, &total],
             )
             .await
             .map_err(backend_err)?;
-        self.client
-            .execute(
-                "UPDATE public.accounts \
-                 SET bandwidth_limit = GREATEST(bandwidth_limit - $1, 0) WHERE account = $2",
-                &[&(bin + bout), &id],
-            )
-            .await
-            .map_err(backend_err)?;
-        Ok(())
+        Ok(row.and_then(|r| r.get::<_, Option<i64>>(0)))
     }
 }
 
@@ -318,23 +340,29 @@ impl AuthBackend for StaticAuthBackend {
         Ok(None)
     }
 
-    async fn report_usage(&self, id: i64, bytes_in: u64, bytes_out: u64) -> Result<(), AuthError> {
+    async fn report_usage(
+        &self,
+        id: i64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> Result<Option<i64>, AuthError> {
         let idx = usize::try_from(id - 1).ok();
         if let Some(user) = idx.and_then(|i| self.users.get(i)) {
             if let Some(rem) = &user.remaining {
-                let total = to_i64(bytes_in) + to_i64(bytes_out);
+                let total = to_i64(bytes_in).saturating_add(to_i64(bytes_out));
                 let mut cur = rem.load(Ordering::Relaxed);
-                loop {
+                let next = loop {
                     let next = (cur - total).max(0);
                     match rem.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
                     {
-                        Ok(_) => break,
+                        Ok(_) => break next,
                         Err(observed) => cur = observed,
                     }
-                }
+                };
+                return Ok(Some(next));
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -378,12 +406,12 @@ mod tests {
     #[tokio::test]
     async fn report_usage_decrements_limit_and_floors_at_zero() {
         let b = backend();
-        // user 2 starts at 1000
-        b.report_usage(2, 300, 200).await.unwrap();
+        // user 2 starts at 1000; report_usage returns the new remaining.
+        assert_eq!(b.report_usage(2, 300, 200).await.unwrap(), Some(500));
         let acct = b.authenticate("limited", "pw").await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, Some(500));
         // overshoot floors at 0
-        b.report_usage(2, 10_000, 0).await.unwrap();
+        assert_eq!(b.report_usage(2, 10_000, 0).await.unwrap(), Some(0));
         let acct = b.authenticate("limited", "pw").await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, Some(0));
     }
@@ -391,7 +419,8 @@ mod tests {
     #[tokio::test]
     async fn unlimited_user_usage_is_noop() {
         let b = backend();
-        b.report_usage(1, 9_999, 9_999).await.unwrap();
+        // Unlimited account: nothing to debit, so no remaining is reported.
+        assert_eq!(b.report_usage(1, 9_999, 9_999).await.unwrap(), None);
         let acct = b.authenticate("me", "hunter2").await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, None);
     }
@@ -527,13 +556,13 @@ mod auth_cov {
     #[tokio::test]
     async fn report_usage_accumulates_and_floors() {
         let b = StaticAuthBackend::new(&[cfg("u", "p", Some(1000))]).unwrap();
-        b.report_usage(1, 100, 100).await.unwrap();
+        assert_eq!(b.report_usage(1, 100, 100).await.unwrap(), Some(800));
         let a = b.authenticate("u", "p").await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(800));
-        b.report_usage(1, 300, 0).await.unwrap();
+        assert_eq!(b.report_usage(1, 300, 0).await.unwrap(), Some(500));
         let a = b.authenticate("u", "p").await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(500));
-        b.report_usage(1, 10_000, 0).await.unwrap();
+        assert_eq!(b.report_usage(1, 10_000, 0).await.unwrap(), Some(0));
         let a = b.authenticate("u", "p").await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(0));
     }
@@ -541,7 +570,7 @@ mod auth_cov {
     #[tokio::test]
     async fn report_usage_unlimited_is_noop() {
         let b = StaticAuthBackend::new(&[cfg("u", "p", None)]).unwrap();
-        b.report_usage(1, 5, 5).await.unwrap();
+        assert_eq!(b.report_usage(1, 5, 5).await.unwrap(), None);
         let a = b.authenticate("u", "p").await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, None);
     }
@@ -549,9 +578,9 @@ mod auth_cov {
     #[tokio::test]
     async fn report_usage_out_of_range_id_is_ignored() {
         let b = StaticAuthBackend::new(&[cfg("u", "p", Some(1000))]).unwrap();
-        // id 0 -> idx underflow None; id 99 -> no such user
-        b.report_usage(0, 10, 10).await.unwrap();
-        b.report_usage(99, 10, 10).await.unwrap();
+        // id 0 -> idx underflow None; id 99 -> no such user. Both report None.
+        assert_eq!(b.report_usage(0, 10, 10).await.unwrap(), None);
+        assert_eq!(b.report_usage(99, 10, 10).await.unwrap(), None);
         let a = b.authenticate("u", "p").await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(1000));
     }

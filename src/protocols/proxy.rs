@@ -69,6 +69,11 @@ impl ProxyServer {
         &self,
         selection: &crate::routing::Selection,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        // An explicit `chain` selection names a `[[proxy]]` label or `[[chain]]`
+        // id directly and takes precedence over the tag dimensions.
+        if let Some(name) = &selection.chain {
+            return self.resolve_ref(name);
+        }
         if !selection.only_session() {
             // Filter upstreams by the selection's tags, then pick (sticky/rotate).
             let candidates: Vec<ProxyConfig> = self
@@ -87,27 +92,32 @@ impl ProxyServer {
     /// The original global resolution: a single `[[proxy]]` by label or a
     /// `[[chain]]` by id, used when no location/ISP selection is given.
     fn resolve_global_chain(&self) -> Result<Vec<ProxyConfig>, ProxyError> {
-        // If router.chain is specified, use that chain
+        // If router.chain names a proxy/chain, resolve it; else fall back to the
+        // first configured proxy (backward compatibility).
         if let Some(chain_ref) = &self.config.chain {
-            // First, try to find a single proxy by label (Single mode)
-            if let Some(proxy) = self
-                .proxy
-                .iter()
-                .find(|p| p.label.as_deref() == Some(chain_ref))
-            {
-                return Ok(vec![proxy.clone()]);
-            }
+            return self.resolve_ref(chain_ref);
+        }
+        let proxy = self
+            .proxy
+            .first()
+            .ok_or_else(|| ProxyError::Protocol("No proxy configuration available".to_string()))?
+            .clone();
+        Ok(vec![proxy])
+    }
 
-            // If not a proxy label, look for a chain configuration
-            if let Some(chains) = self.chains.as_ref() {
-                let chain = chains
-                    .iter()
-                    .find(|c| &c.chain_id == chain_ref)
-                    .ok_or_else(|| {
-                        ProxyError::Protocol(format!("Chain or proxy '{}' not found", chain_ref))
-                    })?;
+    /// Resolve a name to an upstream path: a single `[[proxy]]` by label, else a
+    /// `[[chain]]` by id (applying its `ChainMode`). Errors if neither matches.
+    /// Shared by the global default and explicit `chain` selections.
+    fn resolve_ref(&self, name: &str) -> Result<Vec<ProxyConfig>, ProxyError> {
+        // First, try a single proxy by label.
+        if let Some(proxy) = self.proxy.iter().find(|p| p.label.as_deref() == Some(name)) {
+            return Ok(vec![proxy.clone()]);
+        }
 
-                // Collect all proxy configs from the chain
+        // Otherwise, look for a chain by id.
+        if let Some(chains) = self.chains.as_ref() {
+            if let Some(chain) = chains.iter().find(|c| c.chain_id == name) {
+                // Collect the chain's proxies by label.
                 let mut proxy_configs = Vec::new();
                 for label in &chain.proxies {
                     let proxy = self
@@ -117,51 +127,39 @@ impl ProxyServer {
                         .ok_or_else(|| {
                             ProxyError::Protocol(format!(
                                 "Proxy '{}' not found in chain '{}'",
-                                label, chain_ref
+                                label, name
                             ))
                         })?
                         .clone();
                     proxy_configs.push(proxy);
                 }
 
-                // Apply chain mode
+                // Apply chain mode.
                 use crate::config::ChainMode;
                 let result = match chain.mode {
-                    ChainMode::Strict => {
-                        // Return proxies in order
-                        proxy_configs
-                    }
+                    ChainMode::Strict => proxy_configs,
                     ChainMode::Random => {
-                        // Randomly select proxies
                         use rand::seq::SliceRandom;
                         let mut rng = rand::rng();
-
                         if let Some(count) = chain.count {
-                            // Pick 'count' random proxies
                             let count = count.min(proxy_configs.len());
                             proxy_configs.shuffle(&mut rng);
                             proxy_configs.truncate(count);
                             proxy_configs
                         } else {
-                            // Pick one random proxy
                             proxy_configs.shuffle(&mut rng);
                             vec![proxy_configs.into_iter().next().unwrap()]
                         }
                     }
                 };
-
                 return Ok(result);
             }
         }
 
-        // Fallback: use first proxy (backward compatibility)
-        let proxy = self
-            .proxy
-            .first()
-            .ok_or_else(|| ProxyError::Protocol("No proxy configuration available".to_string()))?
-            .clone();
-
-        Ok(vec![proxy])
+        Err(ProxyError::Protocol(format!(
+            "Chain or proxy '{}' not found",
+            name
+        )))
     }
 
     /// Handle a SOCKS5 connection: greeting + auth (extracting any routing
@@ -841,10 +839,16 @@ impl ProxyServer {
                         stats.add_bytes_out(as_u64(n));
                         metrics::counter!("purroute_bytes_out_total").increment(as_u64(n));
                         if let Some(id) = id {
-                            self.auth
+                            let remaining = self
+                                .auth
                                 .report_usage(id, 0, as_u64(n))
                                 .await
                                 .map_err(auth_io_error)?;
+                            // Mid-stream cut-off: stop once the allowance is spent,
+                            // bounding overage to the chunk already in flight.
+                            if matches!(remaining, Some(r) if r <= 0) {
+                                break Err(ProxyError::BandwidthExceeded);
+                            }
                         }
                         if let Err(e) = upstream_writer.write_all(&buf[..n]).await {
                             stats.record_connection_result(
@@ -886,10 +890,16 @@ impl ProxyServer {
                         stats.add_bytes_in(as_u64(n));
                         metrics::counter!("purroute_bytes_in_total").increment(as_u64(n));
                         if let Some(id) = id {
-                            self.auth
+                            let remaining = self
+                                .auth
                                 .report_usage(id, as_u64(n), 0)
                                 .await
                                 .map_err(auth_io_error)?;
+                            // Mid-stream cut-off: stop once the allowance is spent,
+                            // bounding overage to the chunk already in flight.
+                            if matches!(remaining, Some(r) if r <= 0) {
+                                break Err(ProxyError::BandwidthExceeded);
+                            }
                         }
                         if let Err(e) = client_writer.write_all(&buf[..n]).await {
                             stats.record_connection_result(

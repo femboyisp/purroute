@@ -9,7 +9,7 @@ use crate::config::Tags;
 
 /// Recognised routing keys. The base username ends at the first one of these
 /// that is followed by a value.
-const KEYS: &[&str] = &["country", "city", "isp", "type", "session"];
+const KEYS: &[&str] = &["country", "city", "isp", "type", "session", "chain"];
 
 /// A parsed routing selection. Each dimension is a set; empty = unconstrained.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -21,6 +21,9 @@ pub struct Selection {
     pub kind: Vec<String>,
     /// Sticky-session id: pins one exit deterministically when present.
     pub session: Option<String>,
+    /// Explicit upstream/chain by name: selects a `[[proxy]]` label or a
+    /// `[[chain]]` id directly, taking precedence over the tag dimensions.
+    pub chain: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -37,6 +40,7 @@ impl Selection {
             && self.isp.is_empty()
             && self.kind.is_empty()
             && self.session.is_none()
+            && self.chain.is_none()
     }
 
     /// True when the selection constrains *only* the session (no geo/isp/type) —
@@ -92,6 +96,14 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
         if !KEYS.contains(&key) {
             return Err(RoutingError::UnknownKey(key.to_owned()));
         }
+        // `chain` is terminal and greedy: the remainder is the name. Chain ids
+        // and proxy labels often contain dashes (e.g. `local-exit`), so it can't
+        // be a single `-`-split token like the other dimensions.
+        if key == "chain" {
+            let value = parts[i + 1..].join("-");
+            sel.chain = (!value.is_empty()).then_some(value);
+            break;
+        }
         let value = parts.get(i + 1).copied().unwrap_or("");
         let set: Vec<String> = value
             .split(',')
@@ -104,7 +116,7 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
             "isp" => sel.isp = set,
             "type" => sel.kind = set,
             "session" => sel.session = (!value.is_empty()).then(|| value.to_owned()),
-            _ => unreachable!("checked against KEYS above"),
+            _ => unreachable!("checked against KEYS above; chain handled separately"),
         }
         i += 2;
     }
@@ -174,6 +186,26 @@ mod tests {
         assert_eq!(sel.isp, vec!["comcast"]);
         assert_eq!(sel.kind, vec!["residential"]);
         assert_eq!(sel.session.as_deref(), Some("ab12"));
+    }
+
+    #[test]
+    fn parses_chain_selection_terminal_and_greedy() {
+        // The chain name is the greedy remainder, so dashed ids work.
+        let (base, sel) = parse_username("u-chain-eu-circuit").unwrap();
+        assert_eq!(base, "u");
+        assert_eq!(sel.chain.as_deref(), Some("eu-circuit"));
+        assert!(!sel.is_empty());
+        // A chain selection isn't a tag dimension, so only_session stays true
+        // (the resolver intercepts `chain` before the tag-filter path).
+        assert!(sel.only_session());
+    }
+
+    #[test]
+    fn chain_after_tags_consumes_remainder() {
+        let (base, sel) = parse_username("u-country-us-chain-local-exit").unwrap();
+        assert_eq!(base, "u");
+        assert_eq!(sel.country, vec!["us"]);
+        assert_eq!(sel.chain.as_deref(), Some("local-exit"));
     }
 
     #[test]
