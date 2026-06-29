@@ -111,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let interval = router_config.upstream_refresh_secs.unwrap_or(30);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+            tick.tick().await;
             loop {
                 tick.tick().await;
                 match crate::upstreams::load_dynamic_upstreams(&client).await {
