@@ -215,7 +215,7 @@ impl AuthBackend for PostgresAuthBackend {
         let bout = to_i64(bytes_out);
         let bytes = bin.saturating_add(bout);
         // Value debit = bytes × cost, rounded; floored at i64 range.
-        let debit = ((bytes as f64) * cost_per_byte).floor();
+        let debit = ((bytes as f64) * cost_per_byte).round();
         let debit = if debit.is_finite() && debit > 0.0 {
             debit.min(i64::MAX as f64) as i64
         } else {
@@ -358,7 +358,7 @@ impl AuthBackend for StaticAuthBackend {
         if let Some(user) = idx.and_then(|i| self.users.get(i)) {
             if let Some(rem) = &user.remaining {
                 let bytes = to_i64(bytes_in).saturating_add(to_i64(bytes_out));
-                let debit = ((bytes as f64) * cost_per_byte).floor();
+                let debit = ((bytes as f64) * cost_per_byte).round();
                 let debit = if debit.is_finite() && debit > 0.0 {
                     debit.min(i64::MAX as f64) as i64
                 } else {
@@ -606,7 +606,7 @@ mod auth_cov {
         assert_eq!(b.report_usage(1, 100, 0, 2.0).await.unwrap(), Some(800));
         // 50 in + 50 out at cost 1.0 => debit 100.
         assert_eq!(b.report_usage(1, 50, 50, 1.0).await.unwrap(), Some(700));
-        // fractional cost rounds: 100 bytes at 0.005 => round(0.5) = 1 (banker's? no, round half away).
-        assert_eq!(b.report_usage(1, 100, 0, 0.005).await.unwrap(), Some(700));
+        // fractional cost rounds: 100 bytes at 0.005 => round(0.5) = 1 debit, remaining 699.
+        assert_eq!(b.report_usage(1, 100, 0, 0.005).await.unwrap(), Some(699));
     }
 }
