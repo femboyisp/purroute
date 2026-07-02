@@ -9,12 +9,15 @@ use crate::config::Tags;
 
 /// Recognised routing keys. The base username ends at the first one of these
 /// that is followed by a value.
-const KEYS: &[&str] = &["country", "city", "isp", "type", "session", "chain"];
+const KEYS: &[&str] = &[
+    "country", "state", "city", "isp", "type", "session", "chain",
+];
 
 /// A parsed routing selection. Each dimension is a set; empty = unconstrained.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     pub country: Vec<String>,
+    pub state: Vec<String>,
     pub city: Vec<String>,
     pub isp: Vec<String>,
     /// The `type` dimension (`residential` | `mobile` | `datacenter`).
@@ -36,6 +39,7 @@ impl Selection {
     /// True when no dimension is constrained.
     pub fn is_empty(&self) -> bool {
         self.country.is_empty()
+            && self.state.is_empty()
             && self.city.is_empty()
             && self.isp.is_empty()
             && self.kind.is_empty()
@@ -47,6 +51,7 @@ impl Selection {
     /// i.e. it pins stickiness but doesn't narrow the candidate set.
     pub fn only_session(&self) -> bool {
         self.country.is_empty()
+            && self.state.is_empty()
             && self.city.is_empty()
             && self.isp.is_empty()
             && self.kind.is_empty()
@@ -55,6 +60,7 @@ impl Selection {
     /// Does an upstream's `tags` satisfy every constrained dimension?
     pub fn matches(&self, tags: &Tags) -> bool {
         dim_ok(&self.country, &tags.country)
+            && dim_ok(&self.state, &tags.state)
             && dim_ok(&self.city, &tags.city)
             && dim_ok(&self.isp, &tags.isp)
             && dim_ok(&self.kind, &tags.kind)
@@ -112,6 +118,7 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
             .collect();
         match key {
             "country" => sel.country = set,
+            "state" => sel.state = set,
             "city" => sel.city = set,
             "isp" => sel.isp = set,
             "type" => sel.kind = set,
@@ -155,6 +162,7 @@ mod tests {
     fn tags(country: &str, isp: &str, kind: &str) -> Tags {
         Tags {
             country: Some(country.into()),
+            state: None,
             city: None,
             isp: Some(isp.into()),
             kind: Some(kind.into()),
@@ -256,5 +264,16 @@ mod tests {
         // No session => valid index in range.
         assert!(pick_index(3, None).unwrap() < 3);
         assert_eq!(pick_index(0, None), None);
+    }
+
+    #[test]
+    fn parses_state_dimension() {
+        let (base, sel) = parse_username("u-country-us-state-california-city-losangeles").unwrap();
+        assert_eq!(base, "u");
+        assert_eq!(sel.country, vec!["us"]);
+        assert_eq!(sel.state, vec!["california"]);
+        assert_eq!(sel.city, vec!["losangeles"]);
+        assert!(!sel.is_empty());
+        assert!(!sel.only_session());
     }
 }

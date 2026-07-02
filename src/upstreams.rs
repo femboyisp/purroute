@@ -16,13 +16,14 @@ use tokio_postgres::{Client, Row};
 ///   4  username      — Option<String>
 ///   5  password      — Option<String>
 ///   6  country       — Option<String>
-///   7  city          — Option<String>
-///   8  isp           — Option<String>
-///   9  kind          — Option<String>
-///  10  cost_per_byte — f64
+///   7  state         — Option<String>
+///   8  city          — Option<String>
+///   9  isp           — Option<String>
+///  10  kind          — Option<String>
+///  11  cost_per_byte — f64
 #[allow(clippy::allow_attributes, dead_code)]
 const UPSTREAM_SELECT: &str = "SELECT label, proxy_type, address, port, username, \
-    password, country, city, isp, kind, cost_per_byte \
+    password, country, state, city, isp, kind, cost_per_byte \
     FROM public.upstreams \
     WHERE enabled = true AND (expires_at IS NULL OR expires_at > now())";
 
@@ -48,6 +49,7 @@ fn build_proxy(
     username: Option<String>,
     password: Option<String>,
     country: Option<String>,
+    state: Option<String>,
     city: Option<String>,
     isp: Option<String>,
     kind: Option<String>,
@@ -62,6 +64,7 @@ fn build_proxy(
         password,
         tags: Tags {
             country,
+            state,
             city,
             isp,
             kind,
@@ -84,6 +87,7 @@ fn row_to_proxy(row: &Row) -> ProxyConfig {
         row.get(8),
         row.get(9),
         row.get(10),
+        row.get(11),
     )
 }
 
@@ -121,6 +125,7 @@ mod tests {
             Some("user".into()),
             Some("pass".into()),
             Some("us".into()),
+            Some("ca".into()),
             Some("nyc".into()),
             Some("comcast".into()),
             Some("residential".into()),
@@ -133,6 +138,7 @@ mod tests {
         assert_eq!(p.username.as_deref(), Some("user"));
         assert_eq!(p.password.as_deref(), Some("pass"));
         assert_eq!(p.tags.country.as_deref(), Some("us"));
+        assert_eq!(p.tags.state.as_deref(), Some("ca"));
         assert_eq!(p.tags.city.as_deref(), Some("nyc"));
         assert_eq!(p.tags.isp.as_deref(), Some("comcast"));
         assert_eq!(p.tags.kind.as_deref(), Some("residential"));
@@ -153,6 +159,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             1.0,
         );
         assert_eq!(p.label, None);
@@ -162,6 +169,7 @@ mod tests {
         assert_eq!(p.username, None);
         assert_eq!(p.password, None);
         assert_eq!(p.tags.country, None);
+        assert_eq!(p.tags.state, None);
         assert_eq!(p.tags.city, None);
         assert_eq!(p.tags.isp, None);
         assert_eq!(p.tags.kind, None);
@@ -182,6 +190,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.0,
         );
         assert_eq!(p.port, Some(8080));
@@ -191,6 +200,7 @@ mod tests {
             None,
             "socks5",
             "h".into(),
+            None,
             None,
             None,
             None,
@@ -214,6 +224,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.0,
         );
         assert_eq!(p.port, None);
@@ -224,6 +235,7 @@ mod tests {
             "socks5",
             "h".into(),
             Some(-1),
+            None,
             None,
             None,
             None,
@@ -249,6 +261,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.0,
         );
         assert_eq!(p.proxy_type, Protocol::Socks4);
@@ -257,6 +270,7 @@ mod tests {
             None,
             "https",
             "h".into(),
+            None,
             None,
             None,
             None,
@@ -280,6 +294,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.0,
         );
         assert_eq!(p.proxy_type, Protocol::Socks5);
@@ -292,6 +307,7 @@ mod tests {
             None,
             "socks5",
             "h".into(),
+            None,
             None,
             None,
             None,
@@ -327,8 +343,8 @@ mod tests {
             .query_one(
                 "INSERT INTO public.upstreams \
                  (label,proxy_type,address,port,username,password,\
-                  country,city,isp,kind,cost_per_byte,enabled) \
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) RETURNING id",
+                  country,state,city,isp,kind,cost_per_byte,enabled) \
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true) RETURNING id",
                 &[
                     &Some("test-label"),
                     &"socks5",
@@ -337,6 +353,7 @@ mod tests {
                     &Some("user"),
                     &Some("pass"),
                     &Some("us"),
+                    &Some("ca"),
                     &Some("nyc"),
                     &Some("comcast"),
                     &Some("residential"),
@@ -361,6 +378,7 @@ mod tests {
         assert_eq!(p.password.as_deref(), Some("pass"));
         assert_eq!(p.proxy_type, Protocol::Socks5);
         assert_eq!(p.tags.country.as_deref(), Some("us"));
+        assert_eq!(p.tags.state.as_deref(), Some("ca"));
         assert_eq!(p.tags.city.as_deref(), Some("nyc"));
         assert_eq!(p.tags.isp.as_deref(), Some("comcast"));
         assert_eq!(p.tags.kind.as_deref(), Some("residential"));
