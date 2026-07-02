@@ -67,6 +67,23 @@ impl Selection {
             && dim_ok(&self.isp, &tags.isp)
             && dim_ok(&self.kind, &tags.kind)
     }
+
+    /// Like [`matches`](Self::matches) but an upstream that *templates* a
+    /// dimension (has a `username_prefixes` entry for it) serves any value for
+    /// that dimension, so the tag check is skipped for it.
+    #[allow(dead_code, clippy::allow_attributes)]
+    pub fn matches_upstream(
+        &self,
+        tags: &Tags,
+        prefixes: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        let templated = |dim: &str| prefixes.is_some_and(|p| p.contains_key(dim));
+        (templated("country") || dim_ok(&self.country, &tags.country))
+            && (templated("state") || dim_ok(&self.state, &tags.state))
+            && (templated("city") || dim_ok(&self.city, &tags.city))
+            && (templated("isp") || dim_ok(&self.isp, &tags.isp))
+            && dim_ok(&self.kind, &tags.kind)
+    }
 }
 
 fn dim_ok(wanted: &[String], tag: &Option<String>) -> bool {
@@ -372,5 +389,34 @@ mod tests {
         // Exactly one of the three countries is chosen, deterministically.
         assert_eq!(u, build_username("BASE", &prefixes, &sel));
         assert!(["BASE-country-us", "BASE-country-de", "BASE-country-fr"].contains(&u.as_str()));
+    }
+
+    #[test]
+    fn templated_dimension_matches_any_value() {
+        use std::collections::BTreeMap;
+        // An upstream that templates `country` serves any country, even though its
+        // own country tag is unset.
+        let gw_prefixes: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let untagged = Tags::default();
+        let (_b, sel) = parse_username("u-country-jp").unwrap();
+        // Without templating, an untagged upstream would NOT match a country-constrained selection.
+        assert!(!sel.matches(&untagged));
+        // With the country prefix, it matches any country.
+        assert!(sel.matches_upstream(&untagged, Some(&gw_prefixes)));
+    }
+
+    #[test]
+    fn non_templated_dimension_still_uses_tags() {
+        use std::collections::BTreeMap;
+        // Templates country but NOT isp; an isp-constrained selection still checks the tag.
+        let prefixes: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (_b, sel) = parse_username("u-isp-comcast").unwrap();
+        assert!(!sel.matches_upstream(&Tags::default(), Some(&prefixes))); // isp untagged, not templated
     }
 }
