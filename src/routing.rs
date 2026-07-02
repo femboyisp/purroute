@@ -5,6 +5,8 @@
 //! base username (used for auth) plus a [`Selection`], and matches/picks tagged
 //! upstreams.
 
+use std::collections::BTreeMap;
+
 use crate::config::Tags;
 
 /// Recognised routing keys. The base username ends at the first one of these
@@ -128,6 +130,42 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
         i += 2;
     }
     Ok((base, sel))
+}
+
+/// Build an upstream username from `base` by appending each selected dimension
+/// with its configured prefix, in a fixed order. Multi-value dimensions pick one
+/// value (sticky by session, else random) via [`pick_index`]. A dimension with
+/// no configured prefix, or no selected value, is skipped. An empty selection
+/// yields `base` unchanged.
+#[allow(dead_code, clippy::allow_attributes)]
+pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Selection) -> String {
+    let session = sel.session.as_deref();
+    let mut out = base.to_owned();
+
+    let dims = [
+        ("country", &sel.country),
+        ("state", &sel.state),
+        ("city", &sel.city),
+        ("isp", &sel.isp),
+    ];
+
+    for (dim, vals) in dims {
+        if let Some(i) = pick_index(vals.len(), session) {
+            if let Some(prefix) = prefixes.get(dim) {
+                out.push_str(prefix);
+                out.push_str(&vals[i]);
+            }
+        }
+    }
+
+    if let Some(s) = session {
+        if let Some(prefix) = prefixes.get("session") {
+            out.push_str(prefix);
+            out.push_str(s);
+        }
+    }
+
+    out
 }
 
 /// Pick one index into `len` candidates: deterministic by `session` (sticky),
@@ -275,5 +313,61 @@ mod tests {
         assert_eq!(sel.city, vec!["losangeles"]);
         assert!(!sel.is_empty());
         assert!(!sel.only_session());
+    }
+
+    #[test]
+    fn build_username_appends_selected_dimensions() {
+        use std::collections::BTreeMap;
+        let prefixes: BTreeMap<String, String> = [
+            ("country", "-country-"),
+            ("state", "-state-"),
+            ("city", "-city-"),
+            ("isp", "-isp-"),
+            ("session", "-session-"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        // A full single-value selection composes in country/state/city/isp/session order.
+        let (_b, sel) =
+            parse_username("BASE-country-us-state-california-city-la-isp-comcast-session-s1")
+                .unwrap();
+        assert_eq!(
+            build_username("BASE", &prefixes, &sel),
+            "BASE-country-us-state-california-city-la-isp-comcast-session-s1"
+        );
+
+        // Empty selection => base only (no tokens appended).
+        assert_eq!(
+            build_username("BASE", &prefixes, &Selection::default()),
+            "BASE"
+        );
+
+        // A dimension with no configured prefix is skipped even if selected.
+        let only_country: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (_b, sel2) = parse_username("BASE-country-de-city-berlin").unwrap();
+        assert_eq!(
+            build_username("BASE", &only_country, &sel2),
+            "BASE-country-de"
+        );
+    }
+
+    #[test]
+    fn build_username_picks_one_value_for_multi_value_dims() {
+        use std::collections::BTreeMap;
+        let prefixes: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        // Sticky session makes the pick deterministic.
+        let (_b, sel) = parse_username("BASE-country-us,de,fr-session-abc").unwrap();
+        let u = build_username("BASE", &prefixes, &sel);
+        // Exactly one of the three countries is chosen, deterministically.
+        assert_eq!(u, build_username("BASE", &prefixes, &sel));
+        assert!(["BASE-country-us", "BASE-country-de", "BASE-country-fr"].contains(&u.as_str()));
     }
 }
