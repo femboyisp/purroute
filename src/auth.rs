@@ -159,6 +159,7 @@ impl PostgresAuthBackend {
                     username TEXT,
                     password TEXT,
                     country TEXT,
+                    state TEXT,
                     city TEXT,
                     isp TEXT,
                     kind TEXT,
@@ -169,6 +170,8 @@ impl PostgresAuthBackend {
                     created_at TIMESTAMPTZ DEFAULT now()
                 );
                 CREATE INDEX IF NOT EXISTS idx_upstreams_enabled ON public.upstreams(enabled);
+
+                ALTER TABLE public.upstreams ADD COLUMN IF NOT EXISTS state TEXT;
                 ",
             )
             .await
