@@ -93,6 +93,7 @@ pub struct ChainConfig {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Tags {
     pub country: Option<String>,
+    pub state: Option<String>,
     pub city: Option<String>,
     pub isp: Option<String>,
     /// `residential` | `mobile` | `datacenter`.
@@ -290,6 +291,7 @@ mod tests {
             password: None,
             tags: Tags {
                 country: None,
+                state: None,
                 city: None,
                 isp: None,
                 kind: None,
