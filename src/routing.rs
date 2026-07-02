@@ -322,20 +322,23 @@ mod tests {
             ("country", "-country-"),
             ("state", "-state-"),
             ("city", "-city-"),
-            ("isp", "-isp-"),
+            ("isp", "-asn-"),
             ("session", "-session-"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        // A full single-value selection composes in country/state/city/isp/session order.
+        // A full single-value selection composes in country/state/city/isp/session
+        // order, each dimension using its *configured* prefix — note the `isp`
+        // dimension is emitted with the `-asn-` prefix, distinct from its key, so
+        // this asserts the prefix comes from config and not the dimension name.
         let (_b, sel) =
             parse_username("BASE-country-us-state-california-city-la-isp-comcast-session-s1")
                 .unwrap();
         assert_eq!(
             build_username("BASE", &prefixes, &sel),
-            "BASE-country-us-state-california-city-la-isp-comcast-session-s1"
+            "BASE-country-us-state-california-city-la-asn-comcast-session-s1"
         );
 
         // Empty selection => base only (no tokens appended).
