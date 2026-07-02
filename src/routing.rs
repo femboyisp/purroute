@@ -60,6 +60,12 @@ impl Selection {
     }
 
     /// Does an upstream's `tags` satisfy every constrained dimension?
+    ///
+    /// Superseded by [`matches_upstream`](Self::matches_upstream) as the
+    /// production call site (which additionally accounts for templated
+    /// dimensions); kept for its more direct semantics and exercised by
+    /// tests here and via `matches_upstream(.., None)` equivalence checks.
+    #[allow(dead_code, clippy::allow_attributes)]
     pub fn matches(&self, tags: &Tags) -> bool {
         dim_ok(&self.country, &tags.country)
             && dim_ok(&self.state, &tags.state)
