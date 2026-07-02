@@ -121,7 +121,6 @@ pub struct ProxyConfig {
     /// the selected values appended (e.g. `base-country-us-city-nyc`). Absent =
     /// the static `username` is used unchanged.
     #[serde(default)]
-    #[allow(clippy::allow_attributes, dead_code)]
     pub username_prefixes: Option<std::collections::BTreeMap<String, String>>,
 }
 
