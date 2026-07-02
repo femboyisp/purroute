@@ -116,6 +116,13 @@ pub struct ProxyConfig {
     #[serde(default = "default_cost_per_byte")]
     #[allow(clippy::allow_attributes, dead_code)]
     pub cost_per_byte: f64,
+    /// Optional per-connection username builder: routing dimension -> token
+    /// prefix. When present, the outgoing username is the base `username` with
+    /// the selected values appended (e.g. `base-country-us-city-nyc`). Absent =
+    /// the static `username` is used unchanged.
+    #[serde(default)]
+    #[allow(clippy::allow_attributes, dead_code)]
+    pub username_prefixes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 fn default_cost_per_byte() -> f64 {
@@ -297,6 +304,7 @@ mod tests {
                 kind: None,
             },
             cost_per_byte: 1.0,
+            username_prefixes: None,
         };
         assert_eq!(p.get_upstream_addr(), "proxy.example.com");
     }
@@ -323,5 +331,48 @@ port = 1080
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.proxy[0].address, "10.0.0.1");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn proxy_username_prefixes_parses() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "gw"
+            proxy_type = "Socks5"
+            address = "gw.example.com"
+            port = 9000
+            username = "base"
+            username_prefixes = { country = "-country-", city = "-city-" }
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let p = &cfg.proxy[0];
+        assert_eq!(
+            p.username_prefixes
+                .as_ref()
+                .unwrap()
+                .get("country")
+                .unwrap(),
+            "-country-"
+        );
+        assert_eq!(
+            p.username_prefixes.as_ref().unwrap().get("city").unwrap(),
+            "-city-"
+        );
+    }
+
+    #[test]
+    fn proxy_username_prefixes_defaults_none() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "a"
+            proxy_type = "Socks5"
+            address = "127.0.0.1:9000"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.proxy[0].username_prefixes.is_none());
     }
 }

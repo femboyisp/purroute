@@ -70,6 +70,7 @@ fn build_proxy(
             kind,
         },
         cost_per_byte,
+        username_prefixes: None,
     }
 }
 
