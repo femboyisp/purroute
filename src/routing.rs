@@ -5,16 +5,21 @@
 //! base username (used for auth) plus a [`Selection`], and matches/picks tagged
 //! upstreams.
 
+use std::collections::BTreeMap;
+
 use crate::config::Tags;
 
 /// Recognised routing keys. The base username ends at the first one of these
 /// that is followed by a value.
-const KEYS: &[&str] = &["country", "city", "isp", "type", "session", "chain"];
+const KEYS: &[&str] = &[
+    "country", "state", "city", "isp", "type", "session", "chain",
+];
 
 /// A parsed routing selection. Each dimension is a set; empty = unconstrained.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     pub country: Vec<String>,
+    pub state: Vec<String>,
     pub city: Vec<String>,
     pub isp: Vec<String>,
     /// The `type` dimension (`residential` | `mobile` | `datacenter`).
@@ -36,6 +41,7 @@ impl Selection {
     /// True when no dimension is constrained.
     pub fn is_empty(&self) -> bool {
         self.country.is_empty()
+            && self.state.is_empty()
             && self.city.is_empty()
             && self.isp.is_empty()
             && self.kind.is_empty()
@@ -47,16 +53,40 @@ impl Selection {
     /// i.e. it pins stickiness but doesn't narrow the candidate set.
     pub fn only_session(&self) -> bool {
         self.country.is_empty()
+            && self.state.is_empty()
             && self.city.is_empty()
             && self.isp.is_empty()
             && self.kind.is_empty()
     }
 
     /// Does an upstream's `tags` satisfy every constrained dimension?
+    ///
+    /// Superseded by [`matches_upstream`](Self::matches_upstream) as the
+    /// production call site (which additionally accounts for templated
+    /// dimensions); kept for its more direct semantics and exercised by
+    /// tests here and via `matches_upstream(.., None)` equivalence checks.
+    #[allow(dead_code, clippy::allow_attributes)]
     pub fn matches(&self, tags: &Tags) -> bool {
         dim_ok(&self.country, &tags.country)
+            && dim_ok(&self.state, &tags.state)
             && dim_ok(&self.city, &tags.city)
             && dim_ok(&self.isp, &tags.isp)
+            && dim_ok(&self.kind, &tags.kind)
+    }
+
+    /// Like [`matches`](Self::matches) but an upstream that *templates* a
+    /// dimension (has a `username_prefixes` entry for it) serves any value for
+    /// that dimension, so the tag check is skipped for it.
+    pub fn matches_upstream(
+        &self,
+        tags: &Tags,
+        prefixes: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        let templated = |dim: &str| prefixes.is_some_and(|p| p.contains_key(dim));
+        (templated("country") || dim_ok(&self.country, &tags.country))
+            && (templated("state") || dim_ok(&self.state, &tags.state))
+            && (templated("city") || dim_ok(&self.city, &tags.city))
+            && (templated("isp") || dim_ok(&self.isp, &tags.isp))
             && dim_ok(&self.kind, &tags.kind)
     }
 }
@@ -112,6 +142,7 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
             .collect();
         match key {
             "country" => sel.country = set,
+            "state" => sel.state = set,
             "city" => sel.city = set,
             "isp" => sel.isp = set,
             "type" => sel.kind = set,
@@ -121,6 +152,41 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
         i += 2;
     }
     Ok((base, sel))
+}
+
+/// Build an upstream username from `base` by appending each selected dimension
+/// with its configured prefix, in a fixed order. Multi-value dimensions pick one
+/// value (sticky by session, else random) via [`pick_index`]. A dimension with
+/// no configured prefix, or no selected value, is skipped. An empty selection
+/// yields `base` unchanged.
+pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Selection) -> String {
+    let session = sel.session.as_deref();
+    let mut out = base.to_owned();
+
+    let dims = [
+        ("country", &sel.country),
+        ("state", &sel.state),
+        ("city", &sel.city),
+        ("isp", &sel.isp),
+    ];
+
+    for (dim, vals) in dims {
+        if let Some(i) = pick_index(vals.len(), session) {
+            if let Some(prefix) = prefixes.get(dim) {
+                out.push_str(prefix);
+                out.push_str(&vals[i]);
+            }
+        }
+    }
+
+    if let Some(s) = session {
+        if let Some(prefix) = prefixes.get("session") {
+            out.push_str(prefix);
+            out.push_str(s);
+        }
+    }
+
+    out
 }
 
 /// Pick one index into `len` candidates: deterministic by `session` (sticky),
@@ -155,6 +221,7 @@ mod tests {
     fn tags(country: &str, isp: &str, kind: &str) -> Tags {
         Tags {
             country: Some(country.into()),
+            state: None,
             city: None,
             isp: Some(isp.into()),
             kind: Some(kind.into()),
@@ -256,5 +323,118 @@ mod tests {
         // No session => valid index in range.
         assert!(pick_index(3, None).unwrap() < 3);
         assert_eq!(pick_index(0, None), None);
+    }
+
+    #[test]
+    fn parses_state_dimension() {
+        let (base, sel) = parse_username("u-country-us-state-california-city-losangeles").unwrap();
+        assert_eq!(base, "u");
+        assert_eq!(sel.country, vec!["us"]);
+        assert_eq!(sel.state, vec!["california"]);
+        assert_eq!(sel.city, vec!["losangeles"]);
+        assert!(!sel.is_empty());
+        assert!(!sel.only_session());
+    }
+
+    #[test]
+    fn build_username_appends_selected_dimensions() {
+        use std::collections::BTreeMap;
+        let prefixes: BTreeMap<String, String> = [
+            ("country", "-country-"),
+            ("state", "-state-"),
+            ("city", "-city-"),
+            ("isp", "-asn-"),
+            ("session", "-session-"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        // A full single-value selection composes in country/state/city/isp/session
+        // order, each dimension using its *configured* prefix — note the `isp`
+        // dimension is emitted with the `-asn-` prefix, distinct from its key, so
+        // this asserts the prefix comes from config and not the dimension name.
+        let (_b, sel) =
+            parse_username("BASE-country-us-state-california-city-la-isp-comcast-session-s1")
+                .unwrap();
+        assert_eq!(
+            build_username("BASE", &prefixes, &sel),
+            "BASE-country-us-state-california-city-la-asn-comcast-session-s1"
+        );
+
+        // Empty selection => base only (no tokens appended).
+        assert_eq!(
+            build_username("BASE", &prefixes, &Selection::default()),
+            "BASE"
+        );
+
+        // A dimension with no configured prefix is skipped even if selected.
+        let only_country: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (_b, sel2) = parse_username("BASE-country-de-city-berlin").unwrap();
+        assert_eq!(
+            build_username("BASE", &only_country, &sel2),
+            "BASE-country-de"
+        );
+    }
+
+    #[test]
+    fn build_username_picks_one_value_for_multi_value_dims() {
+        use std::collections::BTreeMap;
+        let prefixes: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        // Sticky session makes the pick deterministic.
+        let (_b, sel) = parse_username("BASE-country-us,de,fr-session-abc").unwrap();
+        let u = build_username("BASE", &prefixes, &sel);
+        // Exactly one of the three countries is chosen, deterministically.
+        assert_eq!(u, build_username("BASE", &prefixes, &sel));
+        assert!(["BASE-country-us", "BASE-country-de", "BASE-country-fr"].contains(&u.as_str()));
+    }
+
+    #[test]
+    fn templated_dimension_matches_any_value() {
+        use std::collections::BTreeMap;
+        // An upstream that templates `country` serves any country, even though its
+        // own country tag is unset.
+        let gw_prefixes: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let untagged = Tags::default();
+        let (_b, sel) = parse_username("u-country-jp").unwrap();
+        // Without templating, an untagged upstream would NOT match a country-constrained selection.
+        assert!(!sel.matches(&untagged));
+        // With the country prefix, it matches any country.
+        assert!(sel.matches_upstream(&untagged, Some(&gw_prefixes)));
+    }
+
+    #[test]
+    fn non_templated_dimension_still_uses_tags() {
+        use std::collections::BTreeMap;
+        // Templates country but NOT isp; an isp-constrained selection still checks the tag.
+        let prefixes: BTreeMap<String, String> = [("country", "-country-")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (_b, sel) = parse_username("u-isp-comcast").unwrap();
+        assert!(!sel.matches_upstream(&Tags::default(), Some(&prefixes))); // isp untagged, not templated
+    }
+
+    #[test]
+    fn matches_upstream_with_no_prefixes_equals_matches() {
+        // A static (non-gateway) upstream templates nothing, so `matches_upstream`
+        // with `None` must fall through to exactly the same result as `matches` —
+        // the back-compat guarantee the static-upstream path in resolution relies on.
+        let (_b, sel) = parse_username("u-country-us-isp-comcast").unwrap();
+        let hit = tags("us", "comcast", "residential");
+        let miss = tags("de", "comcast", "residential");
+        assert_eq!(sel.matches_upstream(&hit, None), sel.matches(&hit));
+        assert!(sel.matches_upstream(&hit, None));
+        assert_eq!(sel.matches_upstream(&miss, None), sel.matches(&miss));
+        assert!(!sel.matches_upstream(&miss, None));
     }
 }
