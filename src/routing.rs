@@ -419,4 +419,18 @@ mod tests {
         let (_b, sel) = parse_username("u-isp-comcast").unwrap();
         assert!(!sel.matches_upstream(&Tags::default(), Some(&prefixes))); // isp untagged, not templated
     }
+
+    #[test]
+    fn matches_upstream_with_no_prefixes_equals_matches() {
+        // A static (non-gateway) upstream templates nothing, so `matches_upstream`
+        // with `None` must fall through to exactly the same result as `matches` —
+        // the back-compat guarantee the static-upstream path in resolution relies on.
+        let (_b, sel) = parse_username("u-country-us-isp-comcast").unwrap();
+        let hit = tags("us", "comcast", "residential");
+        let miss = tags("de", "comcast", "residential");
+        assert_eq!(sel.matches_upstream(&hit, None), sel.matches(&hit));
+        assert!(sel.matches_upstream(&hit, None));
+        assert_eq!(sel.matches_upstream(&miss, None), sel.matches(&miss));
+        assert!(!sel.matches_upstream(&miss, None));
+    }
 }
