@@ -159,7 +159,6 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
 /// value (sticky by session, else random) via [`pick_index`]. A dimension with
 /// no configured prefix, or no selected value, is skipped. An empty selection
 /// yields `base` unchanged.
-#[allow(dead_code, clippy::allow_attributes)]
 pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Selection) -> String {
     let session = sel.session.as_deref();
     let mut out = base.to_owned();
