@@ -79,6 +79,25 @@ impl ProxyServer {
         &self,
         selection: &crate::routing::Selection,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        let mut chain = self.resolve_chain_inner(selection)?;
+        for p in &mut chain {
+            if let Some(prefixes) = &p.username_prefixes {
+                let base = p.username.clone().unwrap_or_default();
+                p.username = Some(crate::routing::build_username(&base, prefixes, selection));
+            }
+        }
+        Ok(chain)
+    }
+
+    /// The un-templated resolution: an explicit `chain` selection, the tag
+    /// filter, or the global `[router].chain` fallback. Upstreams whose tags
+    /// are templated (`username_prefixes`) match any value for that
+    /// dimension; [`resolve_proxy_chain`] fills in the per-connection
+    /// username afterwards.
+    fn resolve_chain_inner(
+        &self,
+        selection: &crate::routing::Selection,
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
         // An explicit `chain` selection names a `[[proxy]]` label or `[[chain]]`
         // id directly and takes precedence over the tag dimensions.
         if let Some(name) = &selection.chain {
@@ -89,7 +108,7 @@ impl ProxyServer {
             let proxies = self.proxy.load();
             let candidates: Vec<ProxyConfig> = proxies
                 .iter()
-                .filter(|p| selection.matches(&p.tags))
+                .filter(|p| selection.matches_upstream(&p.tags, p.username_prefixes.as_ref()))
                 .cloned()
                 .collect();
             let idx = crate::routing::pick_index(candidates.len(), selection.session.as_deref())
@@ -1341,6 +1360,7 @@ mod loopback {
             password: None,
             tags,
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }
     }
 
@@ -1959,6 +1979,80 @@ mod loopback {
             .unwrap();
         assert!(read_body(&mut c).await.contains(BODY));
     }
+
+    #[tokio::test]
+    async fn gateway_upstream_username_encodes_selection() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        // A fake SOCKS5 upstream that records the username offered during user/pass auth.
+        async fn recording_upstream(seen: Arc<Mutex<String>>) -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut s, _)) = listener.accept().await {
+                    // greeting: client offers methods; select user/pass (0x02)
+                    let mut g = [0u8; 2];
+                    s.read_exact(&mut g).await.unwrap();
+                    let mut methods = vec![0u8; g[1] as usize];
+                    s.read_exact(&mut methods).await.unwrap();
+                    s.write_all(&[0x05, 0x02]).await.unwrap();
+                    // user/pass auth: 0x01 ULEN user PLEN pass
+                    let mut hdr = [0u8; 2];
+                    s.read_exact(&mut hdr).await.unwrap();
+                    let mut user = vec![0u8; hdr[1] as usize];
+                    s.read_exact(&mut user).await.unwrap();
+                    let mut plen = [0u8; 1];
+                    s.read_exact(&mut plen).await.unwrap();
+                    let mut pass = vec![0u8; plen[0] as usize];
+                    s.read_exact(&mut pass).await.unwrap();
+                    *seen.lock().unwrap() = String::from_utf8_lossy(&user).to_string();
+                    s.write_all(&[0x01, 0x00]).await.unwrap(); // auth ok
+                                                               // then just close; the router's connect will fail after auth, which is fine.
+                }
+            });
+            addr
+        }
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let up = recording_upstream(Arc::clone(&seen)).await;
+        let mut gw = proxy("gw", Proxy::Socks5, up, Tags::default());
+        gw.username = Some("BASE".to_owned());
+        gw.password = Some("pw".to_owned());
+        gw.username_prefixes = Some(
+            [("country", "-country-"), ("city", "-city-")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<String, String>>(),
+        );
+        // No [router].chain; the single upstream is selected by the tag/templating filter.
+        let srv = build(vec![gw], None, None, vec![user("me", "pw")]);
+        let router = serve_once(srv).await;
+
+        // Drive a SOCKS5 client that authenticates as `me-country-de-city-berlin`.
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        let uname = b"me-country-de-city-berlin";
+        let mut auth = vec![0x01, uname.len() as u8];
+        auth.extend_from_slice(uname);
+        auth.extend_from_slice(&[2, b'p', b'w']);
+        c.write_all(&auth).await.unwrap();
+        let mut ar = [0u8; 2];
+        let _ = c.read_exact(&mut ar).await;
+        // CONNECT to force the upstream connection (auth already happened above).
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        let _ = c.write_all(&req).await;
+        let _ = c.read(&mut [0u8; 16]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The router must have offered the templated username upstream.
+        assert_eq!(*seen.lock().unwrap(), "BASE-country-de-city-berlin");
+    }
 }
 
 #[cfg(test)]
@@ -1983,6 +2077,7 @@ mod proxy_cov2 {
             password: None,
             tags: Tags::default(),
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }
     }
 
@@ -2247,6 +2342,7 @@ mod proxy_cov2 {
                 ..Default::default()
             },
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }];
         let srv = mk(proxies, None, None, vec![user], true);
         let router = serve1(srv).await;
@@ -2278,6 +2374,7 @@ mod proxy_cov2 {
                 ..Default::default()
             },
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }];
         // auth disabled so SOCKS5 uses no-auth, but still hits IP default selection.
         let srv = mk(proxies, None, None, vec![user], false);

@@ -303,6 +303,7 @@ mod chain_cov {
             password: None,
             tags: Tags::default(),
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }
     }
 

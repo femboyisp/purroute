@@ -260,6 +260,7 @@ mod http_cov {
             password: None,
             tags: Tags::default(),
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }
     }
 
@@ -584,6 +585,7 @@ mod http_cov2 {
             password: None,
             tags: Tags::default(),
             cost_per_byte: 1.0,
+            username_prefixes: None,
         }
     }
 
