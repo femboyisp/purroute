@@ -77,7 +77,6 @@ impl Selection {
     /// Like [`matches`](Self::matches) but an upstream that *templates* a
     /// dimension (has a `username_prefixes` entry for it) serves any value for
     /// that dimension, so the tag check is skipped for it.
-    #[allow(dead_code, clippy::allow_attributes)]
     pub fn matches_upstream(
         &self,
         tags: &Tags,
