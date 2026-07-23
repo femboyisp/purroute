@@ -1401,6 +1401,7 @@ mod loopback {
             auth: Some(auth),
             metrics_listen: None,
             upstream_refresh_secs: None,
+            web_backend: None,
         })
     }
 
@@ -2108,6 +2109,7 @@ mod proxy_cov2 {
             auth: Some(auth),
             metrics_listen: None,
             upstream_refresh_secs: None,
+            web_backend: None,
         })
     }
 

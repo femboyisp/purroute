@@ -52,7 +52,7 @@ pub struct DatabaseConfig {
     pub dbname: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouterConfig {
     pub listen: String,
     pub chain: Option<String>,
@@ -66,6 +66,13 @@ pub struct RouterConfig {
     /// merge them with the static config set. Defaults to 30 when a database
     /// is configured; ignored when running database-less.
     pub upstream_refresh_secs: Option<u64>,
+    /// Optional `host:port`. When set, origin-form HTTP requests (a browser
+    /// treating the proxy as a website, `GET /path`) are reverse-proxied here
+    /// instead of being handled as forward-proxy requests. Unset disables it.
+    // Read by handle_connection once the reverse-proxy dispatch lands; the allow
+    // is removed then.
+    #[allow(clippy::allow_attributes, dead_code)]
+    pub web_backend: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -373,5 +380,35 @@ port = 1080
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.proxy[0].username_prefixes.is_none());
+    }
+
+    #[test]
+    fn web_backend_parses_and_defaults_none() {
+        // Present: parsed into Some.
+        let toml_with = r#"
+[router]
+listen = "127.0.0.1:1080"
+web_backend = "127.0.0.1:8090"
+
+[[proxy]]
+label = "upstream"
+proxy_type = "Socks5"
+address = "10.0.0.1"
+"#;
+        let cfg: Config = toml::from_str(toml_with).unwrap();
+        assert_eq!(cfg.router.web_backend.as_deref(), Some("127.0.0.1:8090"));
+
+        // Absent: defaults to None.
+        let toml_without = r#"
+[router]
+listen = "127.0.0.1:1080"
+
+[[proxy]]
+label = "upstream"
+proxy_type = "Socks5"
+address = "10.0.0.1"
+"#;
+        let cfg: Config = toml::from_str(toml_without).unwrap();
+        assert_eq!(cfg.router.web_backend, None);
     }
 }
