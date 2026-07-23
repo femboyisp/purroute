@@ -205,8 +205,20 @@ impl ProxyServer {
         backend: &str,
         global_stats: Arc<GlobalStats>,
     ) -> Result<(), ProxyError> {
-        let mut upstream = match TcpStream::connect(backend).await {
-            Ok(s) => s,
+        match TcpStream::connect(backend).await {
+            Ok(mut upstream) => {
+                if let Err(e) = upstream.write_all(&initial_request).await {
+                    global_stats.log_info(
+                        format!("web_backend {backend} write failed: {e}"),
+                        &self.config,
+                    );
+                } else if let Ok((c2u, u2c)) =
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await
+                {
+                    global_stats.add_bytes_in(c2u);
+                    global_stats.add_bytes_out(u2c);
+                }
+            }
             Err(e) => {
                 global_stats.log_info(
                     format!("web_backend {backend} unreachable: {e}"),
@@ -217,11 +229,12 @@ impl ProxyServer {
                         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     )
                     .await;
-                return Ok(());
             }
-        };
-        upstream.write_all(&initial_request).await?;
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        }
+        // Exactly one decrement per accepted connection: run() increments on
+        // accept and only decrements on the Err path, so this handler — which
+        // always returns Ok — owns its single decrement here.
+        global_stats.decrement_active_connections();
         Ok(())
     }
 
@@ -2788,7 +2801,7 @@ mod proxy_cov2 {
         let front = serve1(srv).await;
 
         let mut c = TcpStream::connect(front).await.unwrap();
-        c.write_all(b"GET /account HTTP/1.1\r\nHost: sockscat.onion\r\n\r\n")
+        c.write_all(b"GET /account HTTP/1.1\r\nHost: example.onion\r\n\r\n")
             .await
             .unwrap();
         // Backend received the origin-form request verbatim (replayed initial bytes).
@@ -2837,6 +2850,41 @@ mod proxy_cov2 {
         assert!(
             String::from_utf8_lossy(&reply[..n]).contains("502"),
             "expected 502 when backend down"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_backend_decrements_active_connections() {
+        // Inject a FRESH GlobalStats (not the shared process singleton) so the
+        // assertion isn't polluted by parallel tests. Mimic run()'s accept-time
+        // increment, then confirm handle_web_backend decrements exactly once (here
+        // via the deterministic 502 path — the single decrement sits at the end
+        // for every path).
+        let stats = Arc::new(GlobalStats::new());
+        stats.increment_active_connections();
+        assert_eq!(stats.get_stats().active_connections, 1);
+
+        // A real stream to hand the handler as its `client`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_side, _) = listener.accept().await.unwrap();
+        let _client_end = client_task.await.unwrap();
+
+        let srv = mk_web("127.0.0.1:1"); // instance only; backend passed explicitly below
+        srv.handle_web_backend(
+            server_side,
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            "127.0.0.1:1", // unreachable -> deterministic 502 path
+            stats.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stats.get_stats().active_connections,
+            0,
+            "handle_web_backend must decrement active_connections exactly once"
         );
     }
 }
