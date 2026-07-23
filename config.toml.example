@@ -8,6 +8,11 @@ auth = true
 # chain = "strict-chain"                         # Strict mode: Use a chain in order
 # chain = "random-chain"                         # Random mode: Pick random proxy(ies) from chain
 metrics_listen = "127.0.0.1:9100"                # (Optional) Local-only Prometheus /metrics endpoint
+# Optional. When set, a browser hitting this router (origin-form HTTP, `GET /path`)
+# is reverse-proxied to this plain-HTTP backend, while SOCKS / forward-proxy traffic
+# on the same port is proxied as usual. Lets one port (or one hidden-service address)
+# serve both a proxy and a web app. Leave unset to disable.
+#web_backend = "127.0.0.1:8090"
 
 # --- Accounts ---------------------------------------------------------------
 # Pick ONE of the two backends below.

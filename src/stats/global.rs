@@ -235,6 +235,7 @@ mod stats_cov {
             auth: None,
             metrics_listen: None,
             upstream_refresh_secs: None,
+            web_backend: None,
         }
     }
 
@@ -433,6 +434,7 @@ mod stats_cov2 {
             auth: None,
             metrics_listen: None,
             upstream_refresh_secs: None,
+            web_backend: None,
         }
     }
 
