@@ -227,15 +227,10 @@ mod stats_cov {
 
     fn cfg(log: bool, verbose: bool, debug: bool) -> RouterConfig {
         RouterConfig {
-            listen: "127.0.0.1:0".into(),
-            chain: None,
             log: Some(log),
             verbose: Some(verbose),
             debug: Some(debug),
-            auth: None,
-            metrics_listen: None,
-            upstream_refresh_secs: None,
-            web_backend: None,
+            ..RouterConfig::default()
         }
     }
 
@@ -426,15 +421,10 @@ mod stats_cov2 {
 
     fn cfg(log: bool, verbose: bool, debug: bool) -> RouterConfig {
         RouterConfig {
-            listen: "127.0.0.1:0".into(),
-            chain: None,
             log: Some(log),
             verbose: Some(verbose),
             debug: Some(debug),
-            auth: None,
-            metrics_listen: None,
-            upstream_refresh_secs: None,
-            web_backend: None,
+            ..RouterConfig::default()
         }
     }
 

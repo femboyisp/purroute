@@ -12,7 +12,7 @@ use crate::config::Tags;
 /// Recognised routing keys. The base username ends at the first one of these
 /// that is followed by a value.
 const KEYS: &[&str] = &[
-    "country", "state", "city", "isp", "type", "session", "chain",
+    "country", "state", "city", "isp", "type", "session", "lifetime", "strict", "chain",
 ];
 
 /// A parsed routing selection. Each dimension is a set; empty = unconstrained.
@@ -21,11 +21,17 @@ pub struct Selection {
     pub country: Vec<String>,
     pub state: Vec<String>,
     pub city: Vec<String>,
+    pub postal: Vec<String>,
     pub isp: Vec<String>,
     /// The `type` dimension (`residential` | `mobile` | `datacenter`).
     pub kind: Vec<String>,
+    pub asn: Option<u32>,
     /// Sticky-session id: pins one exit deterministically when present.
     pub session: Option<String>,
+    /// Sticky session lifetime in minutes (provider-specific passthrough).
+    pub lifetime: Option<String>,
+    /// Strict geo matching: `on` or `off` (provider-specific passthrough).
+    pub strict: Option<String>,
     /// Explicit upstream/chain by name: selects a `[[proxy]]` label or a
     /// `[[chain]]` id directly, taking precedence over the tag dimensions.
     pub chain: Option<String>,
@@ -35,6 +41,8 @@ pub struct Selection {
 pub enum RoutingError {
     #[error("unknown routing key '{0}' in username")]
     UnknownKey(String),
+    #[error("invalid routing selection: {0}")]
+    InvalidSelection(String),
 }
 
 impl Selection {
@@ -43,20 +51,26 @@ impl Selection {
         self.country.is_empty()
             && self.state.is_empty()
             && self.city.is_empty()
+            && self.postal.is_empty()
             && self.isp.is_empty()
             && self.kind.is_empty()
+            && self.asn.is_none()
             && self.session.is_none()
+            && self.lifetime.is_none()
+            && self.strict.is_none()
             && self.chain.is_none()
     }
 
-    /// True when the selection constrains *only* the session (no geo/isp/type) —
+    /// True when the selection constrains *only* the session (no geo/isp/type) -
     /// i.e. it pins stickiness but doesn't narrow the candidate set.
     pub fn only_session(&self) -> bool {
         self.country.is_empty()
             && self.state.is_empty()
             && self.city.is_empty()
+            && self.postal.is_empty()
             && self.isp.is_empty()
             && self.kind.is_empty()
+            && self.asn.is_none()
     }
 
     /// Does an upstream's `tags` satisfy every constrained dimension?
@@ -70,8 +84,10 @@ impl Selection {
         dim_ok(&self.country, &tags.country)
             && dim_ok(&self.state, &tags.state)
             && dim_ok(&self.city, &tags.city)
+            && dim_ok(&self.postal, &tags.postal)
             && dim_ok(&self.isp, &tags.isp)
             && dim_ok(&self.kind, &tags.kind)
+            && asn_ok(self.asn, tags.asn)
     }
 
     /// Like [`matches`](Self::matches) but an upstream that *templates* a
@@ -86,27 +102,163 @@ impl Selection {
         (templated("country") || dim_ok(&self.country, &tags.country))
             && (templated("state") || dim_ok(&self.state, &tags.state))
             && (templated("city") || dim_ok(&self.city, &tags.city))
+            && (templated("postal") || dim_ok(&self.postal, &tags.postal))
             && (templated("isp") || dim_ok(&self.isp, &tags.isp))
             && dim_ok(&self.kind, &tags.kind)
+            && asn_ok(self.asn, tags.asn)
+    }
+}
+
+fn asn_ok(wanted: Option<u32>, tag: Option<u32>) -> bool {
+    match wanted {
+        None => true,
+        Some(w) => tag == Some(w),
     }
 }
 
 fn dim_ok(wanted: &[String], tag: &Option<String>) -> bool {
     if wanted.is_empty() {
-        return true; // dimension unconstrained
+        return true;
+    }
+    if wanted.iter().any(|w| w.eq_ignore_ascii_case("XX")) {
+        return true;
     }
     match tag {
         Some(v) => wanted.iter().any(|w| w.eq_ignore_ascii_case(v)),
-        None => false, // selection constrains this dimension but the upstream is untagged
+        None => false,
+    }
+}
+
+fn legacy_kind_to_scope_modifier(k: &str) -> Option<String> {
+    Some(match k {
+        "residential" | "res" => "res".into(),
+        "mobile" | "mob" => "mob".into(),
+        "datacenter" | "dc" => "dc".into(),
+        other => other.to_owned(),
+    })
+}
+
+/// Map a parsed legacy-keyed selection to the pawprint scope string (geo/type/isp only).
+fn selection_to_auth_scope(sel: &Selection) -> String {
+    if sel.chain.is_some() {
+        return catmac::SCOPE_ANY.to_owned();
+    }
+    if sel.country.len() > 1
+        || sel.state.len() > 1
+        || sel.city.len() > 1
+        || sel.isp.len() > 1
+        || sel.kind.len() > 1
+    {
+        return catmac::SCOPE_ANY.to_owned();
+    }
+
+    let mut territory = catmac::Territory::default();
+    if let Some(c) = sel.country.first() {
+        territory.country = vec![c.to_ascii_uppercase()];
+    }
+    if let Some(s) = sel.state.first() {
+        territory.state = vec![s.to_ascii_uppercase()];
+    }
+    if let Some(c) = sel.city.first() {
+        territory.city = vec![c.to_ascii_uppercase()];
+    }
+    territory.asn = sel.asn;
+
+    let territory = if territory.country.is_empty()
+        && territory.state.is_empty()
+        && territory.city.is_empty()
+        && territory.asn.is_none()
+    {
+        None
+    } else {
+        Some(territory)
+    };
+
+    let mut mods = catmac::Modifiers::default();
+    if let Some(k) = sel.kind.first() {
+        mods.kind = legacy_kind_to_scope_modifier(k);
+    }
+    if let Some(isp) = sel.isp.first() {
+        mods.isp = Some(isp.to_ascii_lowercase());
+    }
+
+    catmac::canonical_scope(territory.as_ref(), &mods)
+}
+
+/// Canonical credential scope for a raw proxy username (SCRFC 2 §6).
+pub fn auth_scope(raw: &str) -> String {
+    if raw.contains('_') {
+        if let Ok((_base, territory, mods)) = catmac::parse_proxy_username(raw) {
+            let auth_mods = catmac::Modifiers {
+                kind: mods.kind.clone(),
+                isp: mods.isp.clone(),
+                ..Default::default()
+            };
+            return catmac::canonical_scope(territory.as_ref(), &auth_mods);
+        }
+    }
+    match parse_username_legacy(raw) {
+        Ok((_base, sel)) => selection_to_auth_scope(&sel),
+        Err(_) => catmac::SCOPE_ANY.to_owned(),
     }
 }
 
 /// Parse a proxy username into `(base_username, selection)`.
 ///
-/// The base is everything up to the first recognised key that has a value;
-/// remaining `key-value` pairs populate the selection. Comma-separated values
-/// form a set. An unrecognised key in the token region is an error.
+/// Usernames containing `_` use SCRFC 1 territory grammar; on parse failure the
+/// connection is rejected. Usernames without `_` use the legacy keyed grammar.
 pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingError> {
+    if username.contains('_') {
+        return parse_username_territory(username);
+    }
+    parse_username_legacy(username)
+}
+
+fn parse_username_territory(username: &str) -> Result<(String, Selection), RoutingError> {
+    let (base, territory, mods) = catmac::parse_proxy_username(username).map_err(|e| {
+        RoutingError::InvalidSelection(match e {
+            catmac::TerritoryError::LegacyUsername => "legacy username".into(),
+            other => other.to_string(),
+        })
+    })?;
+    Ok((base, routing_selection_to_sel(catmac::territory_to_selection(
+        territory.as_ref(),
+        &mods,
+    ))))
+}
+
+fn routing_selection_to_sel(r: catmac::territory::RoutingSelection) -> Selection {
+    Selection {
+        country: r.country,
+        state: r.state,
+        city: r.city,
+        postal: r.postal,
+        isp: r.isp,
+        kind: r.kind,
+        asn: r.asn,
+        session: r.session,
+        lifetime: r.lifetime,
+        strict: r.strict,
+        chain: r.chain,
+    }
+}
+
+/// Parse a stored default selection (territory tag or legacy keyed tokens).
+pub fn parse_default_selection(s: &str) -> Result<Selection, RoutingError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Selection::default());
+    }
+    if let Ok(sel) = catmac::parse_default_selection(s).map(routing_selection_to_sel) {
+        if !sel.is_empty() {
+            return Ok(sel);
+        }
+    }
+    // Back-compat: stored defaults may still embed a legacy base prefix (`me-country-us`).
+    parse_username_legacy(s).map(|(_base, sel)| sel)
+}
+
+fn parse_username_legacy(username: &str) -> Result<(String, Selection), RoutingError> {
     let parts: Vec<&str> = username.split('-').collect();
 
     // First known key (with a following token) ends the base username.
@@ -147,11 +299,42 @@ pub fn parse_username(username: &str) -> Result<(String, Selection), RoutingErro
             "isp" => sel.isp = set,
             "type" => sel.kind = set,
             "session" => sel.session = (!value.is_empty()).then(|| value.to_owned()),
+            "lifetime" => sel.lifetime = (!value.is_empty()).then(|| value.to_owned()),
+            "strict" => sel.strict = (!value.is_empty()).then(|| value.to_owned()),
             _ => unreachable!("checked against KEYS above; chain handled separately"),
         }
         i += 2;
     }
+    validate_selection(&sel)?;
     Ok((base, sel))
+}
+
+fn validate_selection(sel: &Selection) -> Result<(), RoutingError> {
+    if !sel.state.is_empty() && !sel.city.is_empty() {
+        return Err(RoutingError::InvalidSelection(
+            "state and city cannot be combined".into(),
+        ));
+    }
+    if !sel.isp.is_empty() && sel.country.is_empty() {
+        return Err(RoutingError::InvalidSelection(
+            "isp requires country".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Clamp a session id to provider-safe `[A-Za-z0-9_]{1,25}`.
+fn clamp_session_id(s: &str) -> String {
+    const MAX: usize = 25;
+    if !s.is_empty()
+        && s.len() <= MAX
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return s.to_owned();
+    }
+    let mut out = format!("s{:016x}", fnv1a(s));
+    out.truncate(MAX);
+    out
 }
 
 /// Build an upstream username from `base` by appending each selected dimension
@@ -167,6 +350,7 @@ pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Sel
         ("country", &sel.country),
         ("state", &sel.state),
         ("city", &sel.city),
+        ("postal", &sel.postal),
         ("isp", &sel.isp),
     ];
 
@@ -179,14 +363,42 @@ pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Sel
         }
     }
 
+    if let Some(i) = pick_index(sel.kind.len(), session) {
+        if let Some(prefix) = prefixes.get("type") {
+            out.push_str(prefix);
+            out.push_str(&sel.kind[i]);
+        }
+    }
+
     if let Some(s) = session {
         if let Some(prefix) = prefixes.get("session") {
             out.push_str(prefix);
-            out.push_str(s);
+            out.push_str(&clamp_session_id(s));
+        }
+    }
+
+    if let Some(v) = sel.lifetime.as_deref() {
+        if let Some(prefix) = prefixes.get("lifetime") {
+            out.push_str(prefix);
+            out.push_str(v);
+        }
+    }
+
+    if let Some(v) = sel.strict.as_deref() {
+        if let Some(prefix) = prefixes.get("strict") {
+            out.push_str(prefix);
+            out.push_str(v);
         }
     }
 
     out
+}
+
+/// Pick one port from an inclusive range: sticky by `session`, else random.
+pub fn pick_port(range: (u16, u16), session: Option<&str>) -> u16 {
+    let len = u32::from(range.1.saturating_sub(range.0)) + 1;
+    let idx = pick_index(len as usize, session).unwrap_or(0);
+    range.0.saturating_add(idx as u16)
 }
 
 /// Pick one index into `len` candidates: deterministic by `session` (sticky),
@@ -225,6 +437,8 @@ mod tests {
             city: None,
             isp: Some(isp.into()),
             kind: Some(kind.into()),
+            postal: None,
+            asn: None,
         }
     }
 
@@ -276,6 +490,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_state_and_city_combined() {
+        assert_eq!(
+            parse_username("u-country-us-state-ca-city-la"),
+            Err(RoutingError::InvalidSelection(
+                "state and city cannot be combined".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_isp_without_country() {
+        assert_eq!(
+            parse_username("u-isp-comcast"),
+            Err(RoutingError::InvalidSelection("isp requires country".into()))
+        );
+    }
+
+    #[test]
     fn unknown_key_in_token_region_is_an_error() {
         // Once a known key starts the tokens, an unknown key is rejected.
         assert_eq!(
@@ -314,6 +546,17 @@ mod tests {
     }
 
     #[test]
+    fn sticky_port_is_deterministic_random_varies() {
+        let range = (11000_u16, 11010_u16);
+        let a = pick_port(range, Some("sess"));
+        let b = pick_port(range, Some("sess"));
+        assert_eq!(a, b);
+        assert!((11000..=11010).contains(&a));
+        let r = pick_port(range, None);
+        assert!((11000..=11010).contains(&r));
+    }
+
+    #[test]
     fn sticky_session_is_deterministic_random_varies() {
         // Same session id => same index every time.
         let a = pick_index(5, Some("sess"));
@@ -327,11 +570,11 @@ mod tests {
 
     #[test]
     fn parses_state_dimension() {
-        let (base, sel) = parse_username("u-country-us-state-california-city-losangeles").unwrap();
+        let (base, sel) = parse_username("u-country-us-state-california").unwrap();
         assert_eq!(base, "u");
         assert_eq!(sel.country, vec!["us"]);
         assert_eq!(sel.state, vec!["california"]);
-        assert_eq!(sel.city, vec!["losangeles"]);
+        assert!(sel.city.is_empty());
         assert!(!sel.is_empty());
         assert!(!sel.only_session());
     }
@@ -355,11 +598,10 @@ mod tests {
         // dimension is emitted with the `-asn-` prefix, distinct from its key, so
         // this asserts the prefix comes from config and not the dimension name.
         let (_b, sel) =
-            parse_username("BASE-country-us-state-california-city-la-isp-comcast-session-s1")
-                .unwrap();
+            parse_username("BASE-country-us-state-california-isp-comcast-session-s1").unwrap();
         assert_eq!(
             build_username("BASE", &prefixes, &sel),
-            "BASE-country-us-state-california-city-la-asn-comcast-session-s1"
+            "BASE-country-us-state-california-asn-comcast-session-s1"
         );
 
         // Empty selection => base only (no tokens appended).
@@ -420,7 +662,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let (_b, sel) = parse_username("u-isp-comcast").unwrap();
+        let (_b, sel) = parse_username("u-country-us-isp-comcast").unwrap();
         assert!(!sel.matches_upstream(&Tags::default(), Some(&prefixes))); // isp untagged, not templated
     }
 
@@ -436,5 +678,54 @@ mod tests {
         assert!(sel.matches_upstream(&hit, None));
         assert_eq!(sel.matches_upstream(&miss, None), sel.matches(&miss));
         assert!(!sel.matches_upstream(&miss, None));
+    }
+
+    #[test]
+    fn auth_scope_plain_collar_is_any() {
+        assert_eq!(auth_scope("cat-ABCD"), "*");
+    }
+
+    #[test]
+    fn auth_scope_legacy_country_state_type() {
+        assert_eq!(
+            auth_scope("cat-ABCD-country-us-state-ut-type-residential"),
+            "US-UT_t-res"
+        );
+    }
+
+    #[test]
+    fn auth_scope_chain_only_is_any() {
+        assert_eq!(auth_scope("cat-ABCD-chain-eu-circuit"), "*");
+    }
+
+    #[test]
+    fn auth_scope_multi_country_is_any() {
+        assert_eq!(auth_scope("cat-ABCD-country-us,de"), "*");
+    }
+
+    /// Closes the scoped pawprint loop: whisker → paw_key → auth_scope(username) → pawprint → verify.
+    #[test]
+    fn scoped_pawprint_round_trip_for_legacy_username() {
+        use catmac::{mint_whisker, paw_key, paw_key_hex, pawprint, verify_pawprint, AuthKind};
+
+        let username = "cat-TESTCOLLAR1234-country-us-state-ut-type-residential";
+        let whisker = mint_whisker();
+        let k = paw_key(&whisker, 1);
+        let k_hex = paw_key_hex(&whisker, 1);
+
+        let scope = auth_scope(username);
+        assert_eq!(scope, "US-UT_t-res");
+
+        let secret = pawprint(&k, &scope);
+
+        assert!(verify_pawprint(
+            &secret,
+            Some(&k_hex),
+            None,
+            false,
+            AuthKind::Whisker,
+            None,
+            &auth_scope(username),
+        ));
     }
 }

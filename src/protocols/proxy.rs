@@ -74,6 +74,63 @@ impl ProxyServer {
 
     /// Resolve the upstream chain for a connection, honouring a routing
     /// [`Selection`] when it constrains location/ISP/type; otherwise the global
+    /// `[router].chain`. Prepends Tor/I2P hops when the target is a hidden-service host.
+    fn resolve_proxy_chain_for_target(
+        &self,
+        selection: &crate::routing::Selection,
+        target_host: &str,
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        let chain = self.resolve_proxy_chain(selection)?;
+        self.prepend_hidden_hops(chain, target_host)
+    }
+
+    fn prepend_hidden_hops(
+        &self,
+        mut chain: Vec<ProxyConfig>,
+        target_host: &str,
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        let host = target_host.to_ascii_lowercase();
+        if crate::hidden::is_onion(&host) {
+            chain = self.maybe_prepend_hop(&self.config.tor, "Tor", chain)?;
+        } else if crate::hidden::is_i2p(&host) {
+            chain = self.maybe_prepend_hop(&self.config.i2p, "I2p", chain)?;
+        }
+        Ok(chain)
+    }
+
+    fn maybe_prepend_hop(
+        &self,
+        hop: &crate::config::HiddenHopConfig,
+        default_label: &str,
+        mut chain: Vec<ProxyConfig>,
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        if !hop.enabled || !hop.auto_prepend {
+            return Ok(chain);
+        }
+        let label = hop.proxy_label.as_deref().unwrap_or(default_label);
+        if chain
+            .iter()
+            .any(|p| p.label.as_deref() == Some(label))
+        {
+            return Ok(chain);
+        }
+        let proxies = self.proxy.load();
+        let hop_proxy = proxies
+            .iter()
+            .find(|p| p.label.as_deref() == Some(label))
+            .ok_or_else(|| {
+                ProxyError::Protocol(format!(
+                    "hidden-network hop '{label}' is not configured — add [[proxy]] and enable [router].tor/i2p"
+                ))
+            })?
+            .clone();
+        let mut out = vec![hop_proxy];
+        out.extend(chain);
+        Ok(out)
+    }
+
+    /// Resolve the upstream chain for a connection, honouring a routing
+    /// [`Selection`] when it constrains location/ISP/type; otherwise the global
     /// `[router].chain`.
     fn resolve_proxy_chain(
         &self,
@@ -81,6 +138,12 @@ impl ProxyServer {
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
         let mut chain = self.resolve_chain_inner(selection)?;
         for p in &mut chain {
+            if let Some(range) = p.port_range {
+                p.port = Some(crate::routing::pick_port(
+                    range,
+                    selection.session.as_deref(),
+                ));
+            }
             if let Some(prefixes) = &p.username_prefixes {
                 let base = p.username.clone().unwrap_or_default();
                 p.username = Some(crate::routing::build_username(&base, prefixes, selection));
@@ -317,13 +380,14 @@ impl ProxyServer {
                 String::from_utf8_lossy(&auth_request[2 + ulen + 1..2 + ulen + 1 + plen])
                     .to_string();
 
-            // Authenticate with the base username; keep the routing selection.
+            let raw_username = username.clone();
+            let scope = crate::routing::auth_scope(&raw_username);
             let (username, sel) =
-                crate::routing::parse_username(&username).map_err(|_| ProxyError::AuthFailed)?;
+                crate::routing::parse_username(&raw_username).map_err(|_| ProxyError::AuthFailed)?;
             selection = sel;
             let account = self
                 .auth
-                .authenticate(&username, &password)
+                .authenticate(&username, &password, &scope)
                 .await
                 .map_err(|_| ProxyError::AuthFailed)?
                 .ok_or(ProxyError::AuthFailed)?;
@@ -408,7 +472,7 @@ impl ProxyServer {
         if selection.is_empty() && !auth_enabled {
             if let Ok(Some(account)) = self.auth.authenticate_by_ip(peer_addr.ip()).await {
                 if let Some(def) = account.default_selection {
-                    if let Ok((_base, sel)) = crate::routing::parse_username(&def) {
+                    if let Ok(sel) = crate::routing::parse_default_selection(&def) {
                         selection = sel;
                     }
                 }
@@ -416,7 +480,7 @@ impl ProxyServer {
         }
 
         // Resolve the upstream by the selection (single- or multi-hop), then tunnel.
-        let proxy_chain = self.resolve_proxy_chain(&selection)?;
+        let proxy_chain = self.resolve_proxy_chain_for_target(&selection, &target_host)?;
         let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
         metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
         let upstream =
@@ -656,7 +720,10 @@ impl ProxyServer {
                 let selection = server
                     .selection_for(&protocol, &initial_request, peer_addr)
                     .await;
-                let proxy_chain = server.resolve_proxy_chain(&selection)?;
+                let target_guess =
+                    peek_target_host(&protocol, &initial_request).unwrap_or_default();
+                let proxy_chain =
+                    server.resolve_proxy_chain_for_target(&selection, &target_guess)?;
                 let target_proxy = &proxy_chain[0];
 
                 metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
@@ -874,7 +941,7 @@ impl ProxyServer {
         }
         if let Ok(Some(account)) = self.auth.authenticate_by_ip(peer.ip()).await {
             if let Some(def) = account.default_selection {
-                if let Ok((_base, sel)) = crate::routing::parse_username(&def) {
+                if let Ok(sel) = crate::routing::parse_default_selection(&def) {
                     return sel;
                 }
             }
@@ -952,14 +1019,13 @@ impl ProxyServer {
                 let raw_username = parts.next().ok_or(ProxyError::AuthFailed)?;
                 let password = parts.next().ok_or(ProxyError::AuthFailed)?;
 
-                // Authenticate with the *base* username; routing tokens (e.g.
-                // `-country-us`) are stripped off and used for upstream selection.
+                let scope = crate::routing::auth_scope(raw_username);
                 let (username, _selection) = crate::routing::parse_username(raw_username)
                     .map_err(|_| ProxyError::AuthFailed)?;
 
                 let account = self
                     .auth
-                    .authenticate(&username, password)
+                    .authenticate(&username, password, &scope)
                     .await
                     .map_err(|_| ProxyError::AuthFailed)?
                     .ok_or(ProxyError::AuthFailed)?;
@@ -1177,18 +1243,20 @@ fn to_origin_form(request: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Best-effort target host from the inbound handshake (before full auth on SOCKS5).
+fn peek_target_host(protocol: &Proxy, request: &[u8]) -> Option<String> {
+    match protocol {
+        Proxy::Socks4 => parse_socks4_target(request).ok().map(|(h, _)| h),
+        Proxy::Http => parse_http_target(request).ok().map(|(h, _)| h),
+        Proxy::Https => parse_connect_target(request).ok().map(|(h, _)| h),
+        _ => None,
+    }
+}
 /// Split an `authority` (`host` or `host:port`) into host and port, using
 /// `default_port` when none is present.
 fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16), ProxyError> {
-    match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port
-                .parse()
-                .map_err(|_| ProxyError::Protocol("invalid port".into()))?;
-            Ok((host.to_string(), port))
-        }
-        None => Ok((authority.to_string(), default_port)),
-    }
+    crate::hidden::split_authority(authority, default_port)
+        .map_err(|e| ProxyError::Protocol(e))
 }
 
 /// Extract the username from an HTTP `Proxy-Authorization: Basic` header.
@@ -1448,6 +1516,7 @@ mod loopback {
             proxy_type: kind,
             address: addr.ip().to_string(),
             port: Some(addr.port()),
+            port_range: None,
             username: None,
             password: None,
             tags,
@@ -1478,15 +1547,9 @@ mod loopback {
 
     fn router_cfg(chain: Option<&str>, auth: bool) -> Arc<RouterConfig> {
         Arc::new(RouterConfig {
-            listen: "127.0.0.1:0".into(),
             chain: chain.map(str::to_owned),
-            log: Some(false),
-            verbose: Some(false),
-            debug: Some(false),
             auth: Some(auth),
-            metrics_listen: None,
-            upstream_refresh_secs: None,
-            web_backend: None,
+            ..RouterConfig::default()
         })
     }
 
@@ -1525,6 +1588,38 @@ mod loopback {
             "127.0.0.1:1".parse().unwrap(),
             Tags::default(),
         )
+    }
+
+    #[test]
+    fn onion_target_prepends_tor_hop() {
+        let mut tor_cfg = crate::config::HiddenHopConfig::default();
+        tor_cfg.enabled = true;
+        tor_cfg.auto_prepend = true;
+        let router = RouterConfig {
+            chain: Some("residential".into()),
+            auth: Some(false),
+            tor: tor_cfg,
+            ..RouterConfig::default()
+        };
+        let proxies = vec![dummy("Tor"), dummy("residential")];
+        let srv = ProxyServer::new(
+            proxies,
+            None,
+            Arc::new(StatsDisplay::new(
+                get_global_stats(),
+                Duration::from_secs(60),
+                None,
+            )),
+            Arc::new(router),
+            Arc::new(StaticAuthBackend::new(&[]).unwrap()),
+        );
+        let sel = crate::routing::Selection::default();
+        let chain = srv
+            .resolve_proxy_chain_for_target(&sel, "abc123def456.onion")
+            .unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].label.as_deref(), Some("Tor"));
+        assert_eq!(chain[1].label.as_deref(), Some("residential"));
     }
 
     #[test]
@@ -2166,6 +2261,7 @@ mod proxy_cov2 {
             proxy_type: kind,
             address: addr.ip().to_string(),
             port: Some(addr.port()),
+            port_range: None,
             username: None,
             password: None,
             tags: Tags::default(),
@@ -2186,15 +2282,9 @@ mod proxy_cov2 {
 
     fn rcfg(chain: Option<&str>, auth: bool) -> Arc<RouterConfig> {
         Arc::new(RouterConfig {
-            listen: "127.0.0.1:0".into(),
             chain: chain.map(str::to_owned),
-            log: Some(false),
-            verbose: Some(false),
-            debug: Some(false),
             auth: Some(auth),
-            metrics_listen: None,
-            upstream_refresh_secs: None,
-            web_backend: None,
+            ..RouterConfig::default()
         })
     }
 
@@ -2429,6 +2519,7 @@ mod proxy_cov2 {
             proxy_type: Proxy::Http,
             address: us.ip().to_string(),
             port: Some(us.port()),
+            port_range: None,
             username: None,
             password: None,
             tags: Tags {
@@ -2461,6 +2552,7 @@ mod proxy_cov2 {
             proxy_type: Proxy::Socks5,
             address: origin.ip().to_string(),
             port: Some(origin.port()),
+            port_range: None,
             username: None,
             password: None,
             tags: Tags {
@@ -2532,6 +2624,7 @@ mod proxy_cov2 {
                 proxy_type: Proxy::Socks5,
                 address: us.ip().to_string(),
                 port: Some(us.port()),
+                port_range: None,
                 username: None,
                 password: None,
                 tags: Tags {

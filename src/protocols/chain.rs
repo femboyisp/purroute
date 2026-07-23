@@ -35,7 +35,7 @@ impl ChainConnector {
 
         // Connect to first proxy in chain
         let first_proxy = &chain[0];
-        let mut stream = TcpStream::connect(&first_proxy.get_upstream_addr()).await?;
+        let mut stream = TcpStream::connect(first_proxy.get_upstream_addr()).await?;
         stream.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
 
         // For each proxy in the chain, establish connection to the next hop
@@ -268,15 +268,7 @@ impl ChainConnector {
     }
 
     fn parse_address(addr: &str) -> Result<(String, u16), ProxyError> {
-        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(ProxyError::Protocol("Invalid address format".into()));
-        }
-        let port = parts[0]
-            .parse()
-            .map_err(|_| ProxyError::Protocol("Invalid port".into()))?;
-        let host = parts[1].to_string();
-        Ok((host, port))
+        crate::hidden::split_authority(addr, 80).map_err(|e| ProxyError::Protocol(e))
     }
 }
 
@@ -299,6 +291,7 @@ mod chain_cov {
             proxy_type: kind,
             address: addr.ip().to_string(),
             port: Some(addr.port()),
+            port_range: None,
             username: None,
             password: None,
             tags: Tags::default(),
@@ -785,19 +778,17 @@ mod chain_cov {
     }
 
     #[tokio::test]
-    async fn parse_address_no_colon() {
-        let err = ChainConnector::parse_address("noport").unwrap_err();
-        match err {
-            ProxyError::Protocol(m) => assert!(m.contains("Invalid address format")),
-            other => panic!("unexpected: {other:?}"),
-        }
+    async fn parse_address_bare_host_defaults_port() {
+        let (h, p) = ChainConnector::parse_address("tor.local").unwrap();
+        assert_eq!(h, "tor.local");
+        assert_eq!(p, 80);
     }
 
     #[tokio::test]
     async fn parse_address_bad_port() {
         let err = ChainConnector::parse_address("host:notaport").unwrap_err();
         match err {
-            ProxyError::Protocol(m) => assert!(m.contains("Invalid port")),
+            ProxyError::Protocol(m) => assert!(m.contains("invalid port")),
             other => panic!("unexpected: {other:?}"),
         }
     }

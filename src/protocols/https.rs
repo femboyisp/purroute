@@ -238,6 +238,7 @@ mod https_cov {
             proxy_type: kind,
             address: addr.ip().to_string(),
             port: Some(addr.port()),
+            port_range: None,
             username: user.map(|(u, _)| u.to_owned()),
             password: user.map(|(_, p)| p.to_owned()),
             tags: Tags::default(),

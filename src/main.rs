@@ -17,6 +17,7 @@ use tokio_postgres::{Client, Config as PgConfig, NoTls};
 
 mod auth;
 mod config;
+mod hidden;
 mod protocol;
 mod protocols;
 mod routing;
@@ -67,7 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Failed to load stats from database: {e}");
             }
 
-            let backend = Arc::new(PostgresAuthBackend::new(Arc::clone(&client)));
+            let backend = Arc::new(PostgresAuthBackend::new(
+                Arc::clone(&client),
+                router_config.auth_grace_secs,
+            ));
             (backend, Some(client))
         } else {
             if auth_enabled && config.user.is_empty() {

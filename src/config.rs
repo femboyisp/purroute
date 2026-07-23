@@ -52,7 +52,7 @@ pub struct DatabaseConfig {
     pub dbname: String,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RouterConfig {
     pub listen: String,
     pub chain: Option<String>,
@@ -70,6 +70,55 @@ pub struct RouterConfig {
     /// treating the proxy as a website, `GET /path`) are reverse-proxied here
     /// instead of being handled as forward-proxy requests. Unset disables it.
     pub web_backend: Option<String>,
+    /// Grace window (seconds) after paw-key rotation during which the previous
+    /// life still verifies. Defaults to 86400.
+    #[serde(default = "default_auth_grace_secs")]
+    pub auth_grace_secs: u64,
+    /// Tor (.onion) routing: optional local SOCKS hop + auto-prepend for onion targets.
+    #[serde(default)]
+    pub tor: HiddenHopConfig,
+    /// I2P (.i2p) routing: optional local SOCKS hop + auto-prepend for I2P targets.
+    #[serde(default)]
+    pub i2p: HiddenHopConfig,
+}
+
+/// Local Tor/I2P SOCKS hop used to reach hidden-network destinations.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HiddenHopConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `[[proxy]]` label for the local SOCKS hop. Defaults to `Tor` / `I2p`.
+    pub proxy_label: Option<String>,
+    /// When true, prepend this hop for `.onion` / `.i2p` destinations.
+    #[serde(default = "default_auto_prepend")]
+    pub auto_prepend: bool,
+}
+
+fn default_auto_prepend() -> bool {
+    true
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:1080".into(),
+            chain: None,
+            log: None,
+            verbose: None,
+            debug: None,
+            auth: None,
+            metrics_listen: None,
+            upstream_refresh_secs: None,
+            web_backend: None,
+            auth_grace_secs: default_auth_grace_secs(),
+            tor: HiddenHopConfig::default(),
+            i2p: HiddenHopConfig::default(),
+        }
+    }
+}
+
+fn default_auth_grace_secs() -> u64 {
+    86400
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -103,6 +152,8 @@ pub struct Tags {
     /// `residential` | `mobile` | `datacenter`.
     #[serde(rename = "type")]
     pub kind: Option<String>,
+    pub postal: Option<String>,
+    pub asn: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -111,6 +162,10 @@ pub struct ProxyConfig {
     pub proxy_type: Protocol,
     pub address: String,
     pub port: Option<u16>,
+    /// Inclusive port range for load-balancing (`11000-11010` in config). Cleared
+    /// once a concrete port is materialised per connection.
+    #[serde(default, skip)]
+    pub port_range: Option<(u16, u16)>,
     pub username: Option<String>,
     pub password: Option<String>,
     #[serde(flatten)]
@@ -128,18 +183,66 @@ pub struct ProxyConfig {
     pub username_prefixes: Option<std::collections::BTreeMap<String, String>>,
 }
 
+/// Parsed proxy endpoint: host, optional single port, optional inclusive port range.
+pub type ParsedEndpoint = (String, Option<u16>, Option<(u16, u16)>);
+
+/// Split `host`, `host:port`, or `host:start-end` out of a config `address`
+/// field (when no separate `port` is set).
+pub fn parse_endpoint_address(
+    address: &str,
+    explicit_port: Option<u16>,
+) -> Result<ParsedEndpoint, ConfigError> {
+    if explicit_port.is_some() {
+        return Ok((address.to_owned(), explicit_port, None));
+    }
+    let Some((host, port_part)) = address.rsplit_once(':') else {
+        return Ok((address.to_owned(), None, None));
+    };
+    if host.is_empty() {
+        return Err(ConfigError::Endpoint(format!(
+            "invalid proxy address '{address}': empty host"
+        )));
+    }
+    if let Some((start, end)) = port_part.split_once('-') {
+        let start: u16 = start.parse().map_err(|_| {
+            ConfigError::Endpoint(format!("invalid port range start in '{address}'"))
+        })?;
+        let end: u16 = end.parse().map_err(|_| {
+            ConfigError::Endpoint(format!("invalid port range end in '{address}'"))
+        })?;
+        if start > end {
+            return Err(ConfigError::Endpoint(format!(
+                "invalid port range in '{address}': start > end"
+            )));
+        }
+        return Ok((host.to_owned(), None, Some((start, end))));
+    }
+    let port: u16 = port_part
+        .parse()
+        .map_err(|_| ConfigError::Endpoint(format!("invalid port in '{address}'")))?;
+    Ok((host.to_owned(), Some(port), None))
+}
+
+fn normalize_proxy_endpoints(proxies: &mut [ProxyConfig]) -> Result<(), ConfigError> {
+    for p in proxies.iter_mut() {
+        let port = p.port;
+        let (host, single, range) = parse_endpoint_address(&p.address, port)?;
+        p.address = host;
+        p.port = single.or(p.port);
+        p.port_range = range;
+    }
+    Ok(())
+}
+
 fn default_cost_per_byte() -> f64 {
     1.0
 }
 
 impl ProxyConfig {
-    /// `host:port` string for the upstream, falling back to bare address when no
-    /// port is configured.
+    /// `host:port` string for the upstream, applying default port 80 for
+    /// `.onion` / `.i2p` hosts when no port is configured.
     pub fn get_upstream_addr(&self) -> String {
-        match self.port {
-            Some(port) => format!("{}:{}", self.address, port),
-            None => self.address.clone(),
-        }
+        crate::hidden::socket_addr(&self.address, self.port)
     }
 }
 
@@ -147,7 +250,8 @@ impl Config {
     /// Read and parse a config file from `path`.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let config_str = fs::read_to_string(path)?;
-        let config = toml::from_str(&config_str)?;
+        let mut config: Config = toml::from_str(&config_str)?;
+        normalize_proxy_endpoints(&mut config.proxy)?;
         Ok(config)
     }
 }
@@ -158,6 +262,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("invalid proxy endpoint: {0}")]
+    Endpoint(String),
 }
 
 /// Base64 `username:password` for HTTP Basic `Proxy-Authorization`.
@@ -256,6 +362,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_endpoint_address_single_port_and_range() {
+        let (host, port, range) = parse_endpoint_address("gw.example.com:9000", None).unwrap();
+        assert_eq!(host, "gw.example.com");
+        assert_eq!(port, Some(9000));
+        assert!(range.is_none());
+
+        let (host, port, range) =
+            parse_endpoint_address("gw.example.com:11000-11010", None).unwrap();
+        assert_eq!(host, "gw.example.com");
+        assert!(port.is_none());
+        assert_eq!(range, Some((11000, 11010)));
+
+        let (host, port, range) = parse_endpoint_address("bare.host", None).unwrap();
+        assert_eq!(host, "bare.host");
+        assert!(port.is_none());
+        assert!(range.is_none());
+
+        assert!(parse_endpoint_address("gw.example.com:11010-11000", None).is_err());
+    }
+
+    #[test]
+    fn config_load_normalizes_port_range_in_address() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("purroute-range-test-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+[router]
+listen = "127.0.0.1:1080"
+[[proxy]]
+label = "gw"
+proxy_type = "Socks5"
+address = "proxy.example.com:11000-11010"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cfg.proxy[0].address, "proxy.example.com");
+        assert_eq!(cfg.proxy[0].port_range, Some((11000, 11010)));
+    }
+
+    #[test]
     fn encode_auth_is_base64() {
         assert_eq!(encode_auth("user", "pass"), "dXNlcjpwYXNz");
     }
@@ -297,6 +446,7 @@ mod tests {
             proxy_type: Protocol::Socks5,
             address: "proxy.example.com".into(),
             port: None,
+            port_range: None,
             username: None,
             password: None,
             tags: Tags {
@@ -305,6 +455,8 @@ mod tests {
                 city: None,
                 isp: None,
                 kind: None,
+                postal: None,
+                asn: None,
             },
             cost_per_byte: 1.0,
             username_prefixes: None,
