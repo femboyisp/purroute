@@ -359,8 +359,9 @@ impl ProxyServer {
             _ => return Err(ProxyError::Protocol("Unsupported address type".into())),
         };
 
-        // No token selection: fall back to the account's stored default (by IP).
-        if selection.is_empty() {
+        // Credential auth with no routing tokens → worldwide. Stored defaults
+        // apply only on the IP-auth path (auth disabled, source IP allowlisted).
+        if selection.is_empty() && !auth_enabled {
             if let Ok(Some(account)) = self.auth.authenticate_by_ip(peer_addr.ip()).await {
                 if let Some(def) = account.default_selection {
                     if let Ok((_base, sel)) = crate::routing::parse_username(&def) {
@@ -794,14 +795,20 @@ impl ProxyServer {
             Proxy::Socks4 => socks4_userid(request),
             Proxy::Socks5 => None,
         };
+        let had_credentials = username.is_some();
         let from_tokens = username
-            .and_then(|u| crate::routing::parse_username(&u).ok())
+            .as_deref()
+            .and_then(|u| crate::routing::parse_username(u).ok())
             .map(|(_base, sel)| sel)
             .unwrap_or_default();
         if !from_tokens.is_empty() {
             return from_tokens;
         }
-        // No tokens: fall back to the account's stored default, found by IP.
+        // Credentials present but no routing tokens → worldwide. Stored defaults
+        // apply only when there are no credentials (IP-auth HTTP/HTTPS).
+        if had_credentials {
+            return from_tokens;
+        }
         if let Ok(Some(account)) = self.auth.authenticate_by_ip(peer.ip()).await {
             if let Some(def) = account.default_selection {
                 if let Ok((_base, sel)) = crate::routing::parse_username(&def) {
@@ -2396,6 +2403,86 @@ mod proxy_cov2 {
             .await
             .unwrap();
         assert!(drain(&mut c).await.contains(BODY2));
+    }
+
+    /// Password auth with no routing tokens is worldwide even when the source IP
+    /// is allowlisted and the account has a saved default_selection.
+    #[tokio::test]
+    async fn socks5_password_auth_skips_ip_default_selection() {
+        const WW: &str = "WORLDWIDE";
+        let us = s5_origin().await;
+        let ww = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut s, _)) = l.accept().await {
+                    s5_greeting(&mut s).await;
+                    s.write_all(&[0x05, 0x00]).await.unwrap();
+                    let _ = s5_connect(&mut s).await;
+                    s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        WW.len(),
+                        WW
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.flush().await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+            addr
+        };
+        let mut user = usr("me", "pw");
+        user.allowed_ips = vec!["127.0.0.1/32".into()];
+        user.default_selection = Some("me-country-us".into());
+        let proxies = vec![
+            ProxyConfig {
+                label: Some("us".into()),
+                proxy_type: Proxy::Socks5,
+                address: us.ip().to_string(),
+                port: Some(us.port()),
+                username: None,
+                password: None,
+                tags: Tags {
+                    country: Some("us".into()),
+                    ..Default::default()
+                },
+                cost_per_byte: 1.0,
+                username_prefixes: None,
+            },
+            px("ww", Proxy::Socks5, ww),
+        ];
+        let srv = mk(proxies, None, Some("ww"), vec![user], true);
+        let router = serve1(srv).await;
+        let mut c = TcpStream::connect(router).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut sel = [0u8; 2];
+        c.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x02]);
+        c.write_all(&[0x01, 2, b'm', b'e', 2, b'p', b'w'])
+            .await
+            .unwrap();
+        let mut ar = [0u8; 2];
+        c.read_exact(&mut ar).await.unwrap();
+        assert_eq!(ar, [0x01, 0x00]);
+        let host = b"example.com";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&80u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00);
+        c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let body = drain(&mut c).await;
+        assert!(body.contains(WW));
+        assert!(!body.contains(BODY2));
     }
 
     // ---- (3) bandwidth exceeded ----------------------------------------
