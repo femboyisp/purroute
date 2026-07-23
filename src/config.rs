@@ -69,9 +69,6 @@ pub struct RouterConfig {
     /// Optional `host:port`. When set, origin-form HTTP requests (a browser
     /// treating the proxy as a website, `GET /path`) are reverse-proxied here
     /// instead of being handled as forward-proxy requests. Unset disables it.
-    // Read by handle_connection once the reverse-proxy dispatch lands; the allow
-    // is removed then.
-    #[allow(clippy::allow_attributes, dead_code)]
     pub web_backend: Option<String>,
 }
 

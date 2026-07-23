@@ -194,6 +194,37 @@ impl ProxyServer {
     /// Handle a SOCKS5 connection: greeting + auth (extracting any routing
     /// selection from the username), then resolve the upstream by that selection
     /// and tunnel through it (single- or multi-hop) via `ChainConnector`.
+    /// Transparent reverse proxy to the configured web backend: replay the bytes
+    /// already read from the client, then splice both directions. Used for
+    /// origin-form HTTP requests when `[router].web_backend` is set. No HTTP
+    /// rewriting — the client's Host header and relative links pass through.
+    async fn handle_web_backend(
+        &self,
+        mut client: TcpStream,
+        initial_request: Vec<u8>,
+        backend: &str,
+        global_stats: Arc<GlobalStats>,
+    ) -> Result<(), ProxyError> {
+        let mut upstream = match TcpStream::connect(backend).await {
+            Ok(s) => s,
+            Err(e) => {
+                global_stats.log_info(
+                    format!("web_backend {backend} unreachable: {e}"),
+                    &self.config,
+                );
+                let _ = client
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        upstream.write_all(&initial_request).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        Ok(())
+    }
+
     async fn handle_socks5(
         &self,
         mut client: TcpStream,
@@ -586,6 +617,25 @@ impl ProxyServer {
                     format!("Protocol {:?} detected from {}", protocol, peer_addr),
                     &server.config,
                 );
+
+                // Web-backend multiplexing: an origin-form HTTP request (a browser
+                // treating us as a website, `GET /path`) is reverse-proxied to the
+                // configured web backend — distinct from forward-proxy HTTP
+                // (`GET http://host/…`). Only when `[router].web_backend` is set.
+                if protocol == Proxy::Http {
+                    if let Some(backend) = server.config.web_backend.clone() {
+                        if is_origin_form_http(&initial_request) {
+                            return server
+                                .handle_web_backend(
+                                    client,
+                                    initial_request,
+                                    &backend,
+                                    global_stats.clone(),
+                                )
+                                .await;
+                        }
+                    }
+                }
 
                 // Parse any location/ISP selection from the proxy username and
                 // resolve the upstream accordingly (SOCKS5 carries its username
@@ -1204,9 +1254,6 @@ fn parse_http_target(request: &[u8]) -> Result<(String, u16), ProxyError> {
 /// forward-proxy request, which uses **absolute-form** (`GET http://host/…`) or
 /// `CONNECT` (authority-form). Only the first ~64 bytes are inspected, which always
 /// covers the method and the start of the request target.
-// Wired into handle_connection's dispatch when the reverse-proxy branch lands; the
-// allow is removed then.
-#[allow(clippy::allow_attributes, dead_code)]
 fn is_origin_form_http(req: &[u8]) -> bool {
     let head = String::from_utf8_lossy(&req[..req.len().min(64)]);
     let Some(first_line) = head.lines().next() else {
@@ -2690,5 +2737,106 @@ mod proxy_cov2 {
         c.write_all(&[0x05, 0x05, 0x00]).await.unwrap();
         let mut r = [0u8; 2];
         assert!(c.read_exact(&mut r).await.is_err());
+    }
+
+    // ---- web-backend multiplexing --------------------------------------
+
+    /// Fake web backend: accept one connection, capture the received bytes into
+    /// the oneshot, reply 200. Returns (addr, receiver-of-captured-bytes).
+    async fn fake_web_backend() -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                buf.truncate(n);
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = s.flush().await;
+                let _ = tx.send(buf);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// A ProxyServer with `web_backend` set (no upstreams needed — web requests
+    /// short-circuit before upstream resolution).
+    fn mk_web(web_backend: &str) -> ProxyServer {
+        let backend = Arc::new(StaticAuthBackend::new(&[]).unwrap());
+        let display = Arc::new(StatsDisplay::new(
+            get_global_stats(),
+            Duration::from_secs(60),
+            None,
+        ));
+        let cfg = Arc::new(RouterConfig {
+            listen: "127.0.0.1:0".into(),
+            web_backend: Some(web_backend.to_owned()),
+            ..RouterConfig::default()
+        });
+        ProxyServer::new(vec![], None, display, cfg, backend)
+    }
+
+    #[tokio::test]
+    async fn web_backend_relays_origin_form_request() {
+        // Fake web backend captures what it receives and replies 200.
+        let (backend_addr, rx) = fake_web_backend().await;
+        let srv = mk_web(&backend_addr.to_string());
+        let front = serve1(srv).await;
+
+        let mut c = TcpStream::connect(front).await.unwrap();
+        c.write_all(b"GET /account HTTP/1.1\r\nHost: sockscat.onion\r\n\r\n")
+            .await
+            .unwrap();
+        // Backend received the origin-form request verbatim (replayed initial bytes).
+        let got = rx.await.unwrap();
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.starts_with("GET /account HTTP/1.1"), "got: {text}");
+        // And the backend's reply relays back to the client.
+        let mut reply = vec![0u8; 32];
+        let n = c.read(&mut reply).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&reply[..n]).contains("200 OK"),
+            "expected 200 relayed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_backend_absolute_form_not_relayed() {
+        // With web_backend SET, an absolute-form (forward-proxy) request must NOT
+        // reach the web backend — it falls through to the forward-proxy path. The
+        // fake backend must never be contacted.
+        let (backend_addr, rx) = fake_web_backend().await;
+        let srv = mk_web(&backend_addr.to_string());
+        let front = serve1(srv).await;
+        let mut c = TcpStream::connect(front).await.unwrap();
+        let _ = c
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await;
+        let quick = tokio::time::timeout(Duration::from_millis(150), rx).await;
+        assert!(
+            quick.is_err(),
+            "absolute-form must not reach the web backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_backend_down_returns_502() {
+        // web_backend points at a closed port -> client gets a 502, no hang/panic.
+        let srv = mk_web("127.0.0.1:1");
+        let front = serve1(srv).await;
+        let mut c = TcpStream::connect(front).await.unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = vec![0u8; 64];
+        let n = c.read(&mut reply).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&reply[..n]).contains("502"),
+            "expected 502 when backend down"
+        );
     }
 }
