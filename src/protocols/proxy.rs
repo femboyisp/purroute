@@ -1199,6 +1199,31 @@ fn parse_http_target(request: &[u8]) -> Result<(String, u16), ProxyError> {
     ))
 }
 
+/// True when `req` is an **origin-form** HTTP request (`<METHOD> /path HTTP/1.x`) —
+/// a client treating this router as an origin web server. This is distinct from a
+/// forward-proxy request, which uses **absolute-form** (`GET http://host/…`) or
+/// `CONNECT` (authority-form). Only the first ~64 bytes are inspected, which always
+/// covers the method and the start of the request target.
+// Wired into handle_connection's dispatch when the reverse-proxy branch lands; the
+// allow is removed then.
+#[allow(clippy::allow_attributes, dead_code)]
+fn is_origin_form_http(req: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&req[..req.len().min(64)]);
+    let Some(first_line) = head.lines().next() else {
+        return false;
+    };
+    let mut parts = first_line.split(' ');
+    let method = parts.next().unwrap_or("");
+    if !matches!(
+        method,
+        "GET" | "POST" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE" | "PATCH"
+    ) {
+        return false;
+    }
+    // Origin-form targets start with '/'; absolute-form starts with the scheme.
+    parts.next().unwrap_or("").starts_with('/')
+}
+
 /// Parse the target `host:port` from a SOCKS4 or SOCKS4a CONNECT request.
 fn parse_socks4_target(request: &[u8]) -> Result<(String, u16), ProxyError> {
     if request.len() < 9 || request[0] != 0x04 {
@@ -2579,6 +2604,32 @@ mod proxy_cov2 {
             srv.detect_protocol(b"BREW / HTCPCP/1.0\r\n"),
             Err(ProxyError::UnsupportedProtocol)
         ));
+    }
+
+    #[test]
+    fn origin_form_http_detection() {
+        // Origin-form: browser hitting us as a website.
+        assert!(is_origin_form_http(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(is_origin_form_http(
+            b"GET /account HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+        assert!(is_origin_form_http(
+            b"POST /signup HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+        // Absolute-form: forward-proxy request — NOT origin-form.
+        assert!(!is_origin_form_http(
+            b"GET http://example.com/ HTTP/1.1\r\n\r\n"
+        ));
+        // CONNECT (authority-form) — NOT origin-form.
+        assert!(!is_origin_form_http(
+            b"CONNECT example.com:443 HTTP/1.1\r\n\r\n"
+        ));
+        // SOCKS byte prefixes — NOT HTTP at all.
+        assert!(!is_origin_form_http(&[0x05, 0x01, 0x00]));
+        assert!(!is_origin_form_http(&[0x04, 0x01, 0x00, 0x50]));
+        // Empty / garbage.
+        assert!(!is_origin_form_http(b""));
+        assert!(!is_origin_form_http(b"not http at all"));
     }
 
     // ---- (5) malformed SOCKS5 greeting ---------------------------------
