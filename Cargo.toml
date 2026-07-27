@@ -10,7 +10,7 @@ repository = "https://github.com/FemboyISP/purroute"
 [dependencies]
 arc-swap = "1.7.1"
 async-trait = "0.1.89"
-base64 = "0.22.1"
+base64 = "0.23.0"
 chrono = { version = "0.4.41", features = ["serde"] }
 crossterm = "0.29.0"
 futures = "0.3.31"
