@@ -1338,7 +1338,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "once_cell",
  "parking_lot",
- "rand 0.9.4",
+ "rand 0.10.1",
  "reqwest",
  "serde",
  "thiserror",
