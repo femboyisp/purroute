@@ -1,5 +1,5 @@
 # Dockerfile for PostgreSQL
-FROM postgres:13
+FROM postgres:18
 
 # Set environment variables for PostgreSQL
 ENV POSTGRES_DB=purroute
