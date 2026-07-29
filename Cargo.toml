@@ -28,7 +28,7 @@ tokio-util = "0.7.15"
 toml = "0.9.10"
 
 [dev-dependencies]
-reqwest = { version = "0.12.18", features = ["json", "socks"] }
+reqwest = { version = "0.13.0", features = ["json", "socks"] }
 tokio-test = "0.4"
 
 [[test]]
