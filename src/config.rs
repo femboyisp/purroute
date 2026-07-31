@@ -70,6 +70,11 @@ pub struct RouterConfig {
     /// treating the proxy as a website, `GET /path`) are reverse-proxied here
     /// instead of being handled as forward-proxy requests. Unset disables it.
     pub web_backend: Option<String>,
+    /// Optional `[[proxy]]` label or `[[chain]]` id to use whenever the routing
+    /// selection carries a sticky `session` id. Rotating gateways ignore the
+    /// session token, so sticky requests must be pinned to a sticky-capable
+    /// upstream. Unset falls back to the normal tag/`chain` resolution.
+    pub sticky_chain: Option<String>,
     /// Grace window (seconds) after paw-key rotation during which the previous
     /// life still verifies. Defaults to 86400.
     #[serde(default = "default_auth_grace_secs")]
@@ -110,6 +115,7 @@ impl Default for RouterConfig {
             metrics_listen: None,
             upstream_refresh_secs: None,
             web_backend: None,
+            sticky_chain: None,
             auth_grace_secs: default_auth_grace_secs(),
             tor: HiddenHopConfig::default(),
             i2p: HiddenHopConfig::default(),

@@ -166,6 +166,17 @@ impl ProxyServer {
         if let Some(name) = &selection.chain {
             return self.resolve_ref(name);
         }
+        // A sticky `session` id must ride a sticky-capable upstream: rotating
+        // gateways ignore the session token and hand back a fresh exit (or
+        // nothing) each time. When `[router].sticky_chain` is set, any selection
+        // carrying a session resolves to it (tags still compose via the templated
+        // upstream username in `resolve_proxy_chain`). Unset preserves the old
+        // tag/global resolution for OSS deployments without a sticky gateway.
+        if selection.session.is_some() {
+            if let Some(sticky) = &self.config.sticky_chain {
+                return self.resolve_ref(sticky);
+            }
+        }
         if !selection.only_session() {
             // Filter upstreams by the selection's tags, then pick (sticky/rotate).
             let proxies = self.proxy.load();
