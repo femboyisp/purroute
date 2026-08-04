@@ -16,7 +16,7 @@ tag-based exit selection ride on a pluggable `AuthBackend`.
 
 ```toml
 [router]
-listen = "127.0.0.1:1080"
+listen = "socks.cat:1337"   # public gateway; self-hosting? use a local bind like "[::]:1337"
 auth = true
 chain = "exit"
 
@@ -33,7 +33,7 @@ country = "us"
 
 ```sh
 cargo run --release
-curl -x socks5h://me-country-us:hunter2@127.0.0.1:1080 https://api.ipify.org
+curl -x socks5h://me-country-us:hunter2@socks.cat:1337 https://api.ipify.org
 ```
 
 No database required — that config runs a personal proxy. Swap `[[user]]` for a
