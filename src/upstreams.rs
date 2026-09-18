@@ -21,9 +21,11 @@ use tokio_postgres::{Client, Row};
 ///   9  isp           — Option<String>
 ///  10  kind          — Option<String>
 ///  11  cost_per_byte — f64
+///  12  postal        — Option<String>
+///  13  asn           — Option<i64>  → Option<u32>
 #[allow(clippy::allow_attributes, dead_code)]
 const UPSTREAM_SELECT: &str = "SELECT label, proxy_type, address, port, username, \
-    password, country, state, city, isp, kind, cost_per_byte \
+    password, country, state, city, isp, kind, cost_per_byte, postal, asn \
     FROM public.upstreams \
     WHERE enabled = true AND (expires_at IS NULL OR expires_at > now())";
 
@@ -41,38 +43,43 @@ fn protocol_from_str(s: &str) -> Protocol {
 /// Called by `row_to_proxy` with values extracted from a `tokio_postgres::Row`,
 /// and directly by unit tests.
 #[allow(clippy::allow_attributes, dead_code, clippy::too_many_arguments)]
-fn build_proxy(
-    label: Option<String>,
-    proxy_type: &str,
-    address: String,
-    port: Option<i32>,
-    username: Option<String>,
-    password: Option<String>,
-    country: Option<String>,
-    state: Option<String>,
-    city: Option<String>,
-    isp: Option<String>,
-    kind: Option<String>,
-    cost_per_byte: f64,
-) -> ProxyConfig {
-    ProxyConfig {
-        label,
-        proxy_type: protocol_from_str(proxy_type),
-        address,
-        port: port.and_then(|p| u16::try_from(p).ok()),
-        username,
-        password,
-        tags: Tags {
-            country,
-            state,
-            city,
-            isp,
-            kind,
-        },
-        cost_per_byte,
-        username_prefixes: None,
+    fn build_proxy(
+        label: Option<String>,
+        proxy_type: &str,
+        address: String,
+        port: Option<i32>,
+        username: Option<String>,
+        password: Option<String>,
+        country: Option<String>,
+        state: Option<String>,
+        city: Option<String>,
+        isp: Option<String>,
+        kind: Option<String>,
+        cost_per_byte: f64,
+        postal: Option<String>,
+        asn: Option<i32>,
+    ) -> ProxyConfig {
+        ProxyConfig {
+            label,
+            proxy_type: protocol_from_str(proxy_type),
+            address,
+            port: port.and_then(|p| u16::try_from(p).ok()),
+            port_range: None,
+            username,
+            password,
+            tags: Tags {
+                country,
+                state,
+                city,
+                isp,
+                kind,
+                postal,
+                asn: asn.and_then(|a| u32::try_from(a).ok()),
+            },
+            cost_per_byte,
+            username_prefixes: None,
+        }
     }
-}
 
 #[allow(clippy::allow_attributes, dead_code)]
 fn row_to_proxy(row: &Row) -> ProxyConfig {
@@ -89,6 +96,8 @@ fn row_to_proxy(row: &Row) -> ProxyConfig {
         row.get(9),
         row.get(10),
         row.get(11),
+        row.get(12),
+        row.get(13),
     )
 }
 
@@ -131,6 +140,8 @@ mod tests {
             Some("comcast".into()),
             Some("residential".into()),
             2.5,
+            Some("84101".into()),
+            Some(12345),
         );
         assert_eq!(p.label.as_deref(), Some("lab"));
         assert_eq!(p.proxy_type, Protocol::Socks5);
@@ -162,6 +173,8 @@ mod tests {
             None,
             None,
             1.0,
+            None,
+            None,
         );
         assert_eq!(p.label, None);
         assert_eq!(p.proxy_type, Protocol::Http);
@@ -193,6 +206,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.port, Some(8080));
 
@@ -210,6 +225,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.port, None);
 
@@ -227,6 +244,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.port, None);
 
@@ -244,6 +263,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.port, None);
     }
@@ -264,6 +285,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.proxy_type, Protocol::Socks4);
 
@@ -280,6 +303,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.proxy_type, Protocol::Https);
 
@@ -297,6 +322,8 @@ mod tests {
             None,
             None,
             0.0,
+            None,
+            None,
         );
         assert_eq!(p.proxy_type, Protocol::Socks5);
     }
@@ -317,6 +344,8 @@ mod tests {
             None,
             None,
             2.5,
+            None,
+            None,
         );
         assert!((p.cost_per_byte - 2.5).abs() < f64::EPSILON);
     }

@@ -35,7 +35,7 @@ cargo run --release
 
 ```toml
 [router]
-listen = "127.0.0.1:1080"
+listen = "socks.cat:1337"   # public gateway; self-hosting? use a local bind like "[::]:1337"
 auth = true
 chain = "exit"
 
@@ -56,7 +56,7 @@ address = "10.0.0.1:1080"
 # type = "residential"
 ```
 
-Point any proxy client at `127.0.0.1:1080` with `me:hunter2`. With tagged
+Point any proxy client at `socks.cat:1337` with `me:hunter2`. With tagged
 upstreams, select an exit by appending tokens to the username, e.g.
 `me-country-us-type-residential`.
 

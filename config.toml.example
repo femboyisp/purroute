@@ -1,5 +1,5 @@
 [router]
-listen = "127.0.0.1:1337"                        # Address and port for the router to listen on. Can be an array of addresses:ports or a single address:port (ie: ["[::]:1337", "10.13.37.1:1337"]
+listen = "socks.cat:1337"                        # Public gateway address:port clients connect to. Can be a single value or an array (ie: ["[::]:1337", "10.13.37.1:1337"]). Self-hosting? Use your own local bind, e.g. "[::]:1337".
 log = true
 verbose = true
 debug = true
@@ -13,6 +13,9 @@ metrics_listen = "127.0.0.1:9100"                # (Optional) Local-only Prometh
 # on the same port is proxied as usual. Lets one port (or one hidden-service address)
 # serve both a proxy and a web app. Leave unset to disable.
 #web_backend = "127.0.0.1:8090"
+# Auto-prepend Tor/I2P SOCKS hops for .onion / .i2p destinations (see [[proxy]] Tor/I2p below).
+# tor = { enabled = true, proxy_label = "Tor", auto_prepend = true }
+# i2p = { enabled = true, proxy_label = "I2p", auto_prepend = true }
 
 # --- Accounts ---------------------------------------------------------------
 # Pick ONE of the two backends below.
@@ -39,13 +42,18 @@ password = "hunter2"
 [[proxy]] # Each [[proxy]] block is a separate proxy configuration block. If only one is present then it is a single proxy configuration
 label = "Tor"                          # Proxy types supported: Http, Https, Socks4, Socks5
 proxy_type = "Socks5"
-address = "127.0.0.1:9050"                      # If port is not specified (ie: in onion/i2p addresses) we default to 80
+address = "127.0.0.1:9050"                      # Tor SOCKS; bare .onion upstreams default to port 80
 # Optional exit tags — clients select against these with routing tokens in the
 # username, e.g. me-country-us-type-residential. See the wiki: Routing-tokens.
 # country = "us"
 # city = "nyc"
 # isp = "comcast"
 # type = "residential"
+
+[[proxy]]
+label = "I2p"
+proxy_type = "Socks5"
+address = "127.0.0.1:4447"                      # I2P SOCKS (i2pd default)
 
 [[proxy]]
 label = "HttpProxy"

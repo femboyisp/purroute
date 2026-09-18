@@ -1,3 +1,16 @@
+//! Integration tests against the docker-compose stack in this directory.
+//!
+//! These tests are **opt-in**. By default they return immediately without touching
+//! the network or sleeping. To run them:
+//!
+//! ```sh
+//! cd tests/integration && docker-compose up -d
+//! RUN_PURROUTE_INTEGRATION=1 cargo test -p purroute --test integration -- --nocapture
+//! ```
+//!
+//! When `RUN_PURROUTE_INTEGRATION` is unset, each test skips instantly.
+//! When it is `1`, the stack must be up (SOCKS5 on `127.0.0.1:1080`) or the test **fails**.
+
 use reqwest::{Client, Proxy as ReqwestProxy};
 use std::error::Error;
 use std::time::Duration;
@@ -5,6 +18,36 @@ use tokio::time::sleep;
 
 const TEST_USER: &str = "testuser";
 const TEST_PASS: &str = "testpass";
+
+fn integration_enabled() -> bool {
+    std::env::var("RUN_PURROUTE_INTEGRATION")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn integration_stack_ready() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr: SocketAddr = "127.0.0.1:1080".parse().expect("addr");
+    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Gate integration tests: skip when opt-in env is unset; fail when opt-in but stack down.
+fn require_integration() -> bool {
+    if !integration_enabled() {
+        eprintln!("integration: skipped (set RUN_PURROUTE_INTEGRATION=1 to run)");
+        return false;
+    }
+    if !integration_stack_ready() {
+        panic!(
+            "integration: RUN_PURROUTE_INTEGRATION=1 but nothing on :1080 — \
+             start tests/integration/docker-compose.yml"
+        );
+    }
+    true
+}
+
 // Hermetic targets: default to the local `target:8080` container from
 // tests/integration/docker-compose.yml. Override with TEST_TARGET_* env vars to
 // point at a different endpoint.
@@ -26,13 +69,16 @@ fn https_test_url() -> String {
 }
 
 async fn wait_for_services() {
-    // Wait for services to be ready
-    sleep(Duration::from_secs(10)).await;
+    // Port probe in `require_integration` already confirmed :1080; brief settle only.
+    sleep(Duration::from_millis(500)).await;
 }
 
 // SOCKS5 with auth
 #[tokio::test]
 async fn test_socks5_proxy_auth() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all("socks5://testuser:testpass@localhost:1080")?;
     let client = Client::builder()
@@ -55,6 +101,9 @@ async fn test_socks5_proxy_auth() -> Result<(), Box<dyn Error>> {
 // SOCKS5 without auth
 #[tokio::test]
 async fn test_socks5_proxy_noauth() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all("socks5://localhost:1082")?;
     let client = Client::builder()
@@ -77,6 +126,9 @@ async fn test_socks5_proxy_noauth() -> Result<(), Box<dyn Error>> {
 // SOCKS4 with auth
 #[tokio::test]
 async fn test_socks4_proxy_auth() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all("socks4://testuser:testpass@localhost:1081")?;
     let client = Client::builder()
@@ -99,6 +151,9 @@ async fn test_socks4_proxy_auth() -> Result<(), Box<dyn Error>> {
 // SOCKS4 without auth
 #[tokio::test]
 async fn test_socks4_proxy_noauth() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all("socks4://localhost:1083")?;
     let client = Client::builder()
@@ -121,6 +176,9 @@ async fn test_socks4_proxy_noauth() -> Result<(), Box<dyn Error>> {
 // HTTP proxy without auth
 #[tokio::test]
 async fn test_http_proxy_noauth() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all("http://localhost:8889")?;
     let client = Client::builder()
@@ -140,6 +198,9 @@ async fn test_http_proxy_noauth() -> Result<(), Box<dyn Error>> {
 // HTTP proxy with auth
 #[tokio::test]
 async fn test_http_proxy_auth() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all(format!("http://{}:{}@localhost:8888", TEST_USER, TEST_PASS))?;
     let client = Client::builder()
@@ -159,6 +220,9 @@ async fn test_http_proxy_auth() -> Result<(), Box<dyn Error>> {
 // HTTPS proxy test
 #[tokio::test]
 async fn test_https_proxy() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
     let proxy = ReqwestProxy::all(format!("http://{}:{}@localhost:8888", TEST_USER, TEST_PASS))?;
     let client = Client::builder()
@@ -176,6 +240,9 @@ async fn test_https_proxy() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_socks4a_proxy() -> Result<(), Box<dyn Error>> {
+    if !require_integration() {
+        return Ok(());
+    }
     wait_for_services().await;
 
     let proxy = ReqwestProxy::all("socks4a://localhost:1081")?;

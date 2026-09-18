@@ -20,6 +20,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use catmac::AuthKind;
+
+#[cfg(test)]
+use catmac::SCOPE_ANY;
+use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use tokio_postgres::Client;
 
@@ -44,11 +49,12 @@ pub enum AuthError {
 /// The router's only dependency on user accounts.
 #[async_trait]
 pub trait AuthBackend: Send + Sync {
-    /// Verify credentials. `Ok(None)` = no such user.
+    /// Verify credentials against `scope` (SCRFC 2 canonical scope). `Ok(None)` = no such user or bad secret.
     async fn authenticate(
         &self,
         username: &str,
         secret: &str,
+        scope: &str,
     ) -> Result<Option<Account>, AuthError>;
 
     /// Authorise a connection by its source IP (allowlist). `Ok(None)` = the IP
@@ -74,11 +80,15 @@ pub trait AuthBackend: Send + Sync {
 /// schema. This is the default and what the standalone router ships with.
 pub struct PostgresAuthBackend {
     client: Arc<Client>,
+    auth_grace_secs: u64,
 }
 
 impl PostgresAuthBackend {
-    pub fn new(client: Arc<Client>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<Client>, auth_grace_secs: u64) -> Self {
+        Self {
+            client,
+            auth_grace_secs,
+        }
     }
 
     /// Create the minimal schema the router needs, if absent. Idempotent.
@@ -121,6 +131,13 @@ impl PostgresAuthBackend {
                 -- a connection requests none (e.g. IP-auth users).
                 ALTER TABLE public.accounts
                     ADD COLUMN IF NOT EXISTS default_selection TEXT;
+
+                ALTER TABLE public.accounts
+                    ADD COLUMN IF NOT EXISTS paw_key TEXT,
+                    ADD COLUMN IF NOT EXISTS paw_key_prev TEXT,
+                    ADD COLUMN IF NOT EXISTS life INT DEFAULT 1,
+                    ADD COLUMN IF NOT EXISTS rotated_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS auth_kind TEXT DEFAULT 'legacy';
 
                 -- Source IPs / CIDRs allowed to authenticate by address.
                 CREATE TABLE IF NOT EXISTS public.account_ips (
@@ -172,6 +189,8 @@ impl PostgresAuthBackend {
                 CREATE INDEX IF NOT EXISTS idx_upstreams_enabled ON public.upstreams(enabled);
 
                 ALTER TABLE public.upstreams ADD COLUMN IF NOT EXISTS state TEXT;
+                ALTER TABLE public.upstreams ADD COLUMN IF NOT EXISTS postal TEXT;
+                ALTER TABLE public.upstreams ADD COLUMN IF NOT EXISTS asn BIGINT;
                 ",
             )
             .await
@@ -192,17 +211,49 @@ impl AuthBackend for PostgresAuthBackend {
         &self,
         username: &str,
         secret: &str,
+        scope: &str,
     ) -> Result<Option<Account>, AuthError> {
         let row = self
             .client
             .query_opt(
-                "SELECT account, bandwidth_limit, default_selection FROM public.accounts \
-                 WHERE username = $1 AND password = $2",
-                &[&username, &secret],
+                "SELECT account, bandwidth_limit, default_selection, paw_key, paw_key_prev, \
+                 rotated_at, auth_kind, password FROM public.accounts WHERE username = $1",
+                &[&username],
             )
             .await
             .map_err(backend_err)?;
-        Ok(row.map(|row| Account {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let paw_key: Option<String> = row.get(3);
+        let paw_key_prev: Option<String> = row.get(4);
+        let rotated_at: Option<DateTime<Utc>> = row.get(5);
+        let auth_kind: Option<String> = row.get(6);
+        let legacy_password: Option<String> = row.get(7);
+
+        let in_grace = rotated_at.is_some_and(|t| {
+            let grace_end = t + chrono::Duration::seconds(self.auth_grace_secs as i64);
+            Utc::now() < grace_end
+        });
+        let kind = match auth_kind.as_deref() {
+            Some("whisker") => AuthKind::Whisker,
+            _ => AuthKind::Legacy,
+        };
+
+        if !catmac::verify_pawprint(
+            secret,
+            paw_key.as_deref(),
+            paw_key_prev.as_deref(),
+            in_grace,
+            kind,
+            legacy_password.as_deref(),
+            scope,
+        ) {
+            return Ok(None);
+        }
+
+        Ok(Some(Account {
             id: row.get(0),
             bandwidth_limit: row.get(1),
             default_selection: row.get(2),
@@ -353,6 +404,7 @@ impl AuthBackend for StaticAuthBackend {
         &self,
         username: &str,
         secret: &str,
+        _scope: &str,
     ) -> Result<Option<Account>, AuthError> {
         for (i, u) in self.users.iter().enumerate() {
             if u.username == username && constant_time_eq(&u.password, secret) {
@@ -428,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticates_known_user_unlimited() {
-        let acct = backend().authenticate("me", "hunter2").await.unwrap();
+        let acct = backend().authenticate("me", "hunter2", SCOPE_ANY).await.unwrap();
         let acct = acct.expect("should authenticate");
         assert_eq!(acct.id, 1);
         assert_eq!(acct.bandwidth_limit, None);
@@ -437,8 +489,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_wrong_password_and_unknown_user() {
         let b = backend();
-        assert!(b.authenticate("me", "wrong").await.unwrap().is_none());
-        assert!(b.authenticate("ghost", "x").await.unwrap().is_none());
+        assert!(b.authenticate("me", "wrong", SCOPE_ANY).await.unwrap().is_none());
+        assert!(b.authenticate("ghost", "x", SCOPE_ANY).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -446,11 +498,11 @@ mod tests {
         let b = backend();
         // user 2 starts at 1000; report_usage returns the new remaining.
         assert_eq!(b.report_usage(2, 300, 200, 1.0).await.unwrap(), Some(500));
-        let acct = b.authenticate("limited", "pw").await.unwrap().unwrap();
+        let acct = b.authenticate("limited", "pw", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, Some(500));
         // overshoot floors at 0
         assert_eq!(b.report_usage(2, 10_000, 0, 1.0).await.unwrap(), Some(0));
-        let acct = b.authenticate("limited", "pw").await.unwrap().unwrap();
+        let acct = b.authenticate("limited", "pw", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, Some(0));
     }
 
@@ -459,7 +511,7 @@ mod tests {
         let b = backend();
         // Unlimited account: nothing to debit, so no remaining is reported.
         assert_eq!(b.report_usage(1, 9_999, 9_999, 1.0).await.unwrap(), None);
-        let acct = b.authenticate("me", "hunter2").await.unwrap().unwrap();
+        let acct = b.authenticate("me", "hunter2", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(acct.bandwidth_limit, None);
     }
 
@@ -518,7 +570,7 @@ mod auth_cov {
         let mut u = cfg("me", "pw", Some(4096));
         u.default_selection = Some("country-de".into());
         let b = StaticAuthBackend::new(&[u]).unwrap();
-        let a = b.authenticate("me", "pw").await.unwrap().expect("hit");
+        let a = b.authenticate("me", "pw", SCOPE_ANY).await.unwrap().expect("hit");
         assert_eq!(a.id, 1);
         assert_eq!(a.bandwidth_limit, Some(4096));
         assert_eq!(a.default_selection.as_deref(), Some("country-de"));
@@ -527,14 +579,14 @@ mod auth_cov {
     #[tokio::test]
     async fn authenticate_miss_unknown_and_wrong_password() {
         let b = StaticAuthBackend::new(&[cfg("me", "secret", None)]).unwrap();
-        assert!(b.authenticate("nobody", "secret").await.unwrap().is_none());
-        assert!(b.authenticate("me", "nope").await.unwrap().is_none());
+        assert!(b.authenticate("nobody", "secret", SCOPE_ANY).await.unwrap().is_none());
+        assert!(b.authenticate("me", "nope", SCOPE_ANY).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn second_user_gets_id_two() {
         let b = StaticAuthBackend::new(&[cfg("a", "1", None), cfg("b", "2", None)]).unwrap();
-        let a = b.authenticate("b", "2").await.unwrap().unwrap();
+        let a = b.authenticate("b", "2", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(a.id, 2);
     }
 
@@ -595,13 +647,13 @@ mod auth_cov {
     async fn report_usage_accumulates_and_floors() {
         let b = StaticAuthBackend::new(&[cfg("u", "p", Some(1000))]).unwrap();
         assert_eq!(b.report_usage(1, 100, 100, 1.0).await.unwrap(), Some(800));
-        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        let a = b.authenticate("u", "p", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(800));
         assert_eq!(b.report_usage(1, 300, 0, 1.0).await.unwrap(), Some(500));
-        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        let a = b.authenticate("u", "p", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(500));
         assert_eq!(b.report_usage(1, 10_000, 0, 1.0).await.unwrap(), Some(0));
-        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        let a = b.authenticate("u", "p", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(0));
     }
 
@@ -609,7 +661,7 @@ mod auth_cov {
     async fn report_usage_unlimited_is_noop() {
         let b = StaticAuthBackend::new(&[cfg("u", "p", None)]).unwrap();
         assert_eq!(b.report_usage(1, 5, 5, 1.0).await.unwrap(), None);
-        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        let a = b.authenticate("u", "p", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, None);
     }
 
@@ -619,7 +671,7 @@ mod auth_cov {
         // id 0 -> idx underflow None; id 99 -> no such user. Both report None.
         assert_eq!(b.report_usage(0, 10, 10, 1.0).await.unwrap(), None);
         assert_eq!(b.report_usage(99, 10, 10, 1.0).await.unwrap(), None);
-        let a = b.authenticate("u", "p").await.unwrap().unwrap();
+        let a = b.authenticate("u", "p", SCOPE_ANY).await.unwrap().unwrap();
         assert_eq!(a.bandwidth_limit, Some(1000));
     }
 
@@ -645,6 +697,7 @@ mod auth_cov {
                 &self,
                 _username: &str,
                 _secret: &str,
+                _scope: &str,
             ) -> Result<Option<Account>, AuthError> {
                 Ok(None)
             }
@@ -666,7 +719,7 @@ mod auth_cov {
             .unwrap();
         assert!(result.is_none());
         // Also exercise the other required methods so their bodies are counted.
-        assert!(b.authenticate("u", "p").await.unwrap().is_none());
+        assert!(b.authenticate("u", "p", SCOPE_ANY).await.unwrap().is_none());
         assert!(b.report_usage(1, 0, 0, 1.0).await.unwrap().is_none());
     }
 }
