@@ -480,7 +480,10 @@ mod tests {
 
     #[tokio::test]
     async fn authenticates_known_user_unlimited() {
-        let acct = backend().authenticate("me", "hunter2", SCOPE_ANY).await.unwrap();
+        let acct = backend()
+            .authenticate("me", "hunter2", SCOPE_ANY)
+            .await
+            .unwrap();
         let acct = acct.expect("should authenticate");
         assert_eq!(acct.id, 1);
         assert_eq!(acct.bandwidth_limit, None);
@@ -489,8 +492,16 @@ mod tests {
     #[tokio::test]
     async fn rejects_wrong_password_and_unknown_user() {
         let b = backend();
-        assert!(b.authenticate("me", "wrong", SCOPE_ANY).await.unwrap().is_none());
-        assert!(b.authenticate("ghost", "x", SCOPE_ANY).await.unwrap().is_none());
+        assert!(b
+            .authenticate("me", "wrong", SCOPE_ANY)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(b
+            .authenticate("ghost", "x", SCOPE_ANY)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -498,11 +509,19 @@ mod tests {
         let b = backend();
         // user 2 starts at 1000; report_usage returns the new remaining.
         assert_eq!(b.report_usage(2, 300, 200, 1.0).await.unwrap(), Some(500));
-        let acct = b.authenticate("limited", "pw", SCOPE_ANY).await.unwrap().unwrap();
+        let acct = b
+            .authenticate("limited", "pw", SCOPE_ANY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(acct.bandwidth_limit, Some(500));
         // overshoot floors at 0
         assert_eq!(b.report_usage(2, 10_000, 0, 1.0).await.unwrap(), Some(0));
-        let acct = b.authenticate("limited", "pw", SCOPE_ANY).await.unwrap().unwrap();
+        let acct = b
+            .authenticate("limited", "pw", SCOPE_ANY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(acct.bandwidth_limit, Some(0));
     }
 
@@ -511,7 +530,11 @@ mod tests {
         let b = backend();
         // Unlimited account: nothing to debit, so no remaining is reported.
         assert_eq!(b.report_usage(1, 9_999, 9_999, 1.0).await.unwrap(), None);
-        let acct = b.authenticate("me", "hunter2", SCOPE_ANY).await.unwrap().unwrap();
+        let acct = b
+            .authenticate("me", "hunter2", SCOPE_ANY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(acct.bandwidth_limit, None);
     }
 
@@ -570,7 +593,11 @@ mod auth_cov {
         let mut u = cfg("me", "pw", Some(4096));
         u.default_selection = Some("country-de".into());
         let b = StaticAuthBackend::new(&[u]).unwrap();
-        let a = b.authenticate("me", "pw", SCOPE_ANY).await.unwrap().expect("hit");
+        let a = b
+            .authenticate("me", "pw", SCOPE_ANY)
+            .await
+            .unwrap()
+            .expect("hit");
         assert_eq!(a.id, 1);
         assert_eq!(a.bandwidth_limit, Some(4096));
         assert_eq!(a.default_selection.as_deref(), Some("country-de"));
@@ -579,8 +606,16 @@ mod auth_cov {
     #[tokio::test]
     async fn authenticate_miss_unknown_and_wrong_password() {
         let b = StaticAuthBackend::new(&[cfg("me", "secret", None)]).unwrap();
-        assert!(b.authenticate("nobody", "secret", SCOPE_ANY).await.unwrap().is_none());
-        assert!(b.authenticate("me", "nope", SCOPE_ANY).await.unwrap().is_none());
+        assert!(b
+            .authenticate("nobody", "secret", SCOPE_ANY)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(b
+            .authenticate("me", "nope", SCOPE_ANY)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

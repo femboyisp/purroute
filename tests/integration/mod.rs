@@ -20,10 +20,7 @@ const TEST_USER: &str = "testuser";
 const TEST_PASS: &str = "testpass";
 
 fn integration_enabled() -> bool {
-    std::env::var("RUN_PURROUTE_INTEGRATION")
-        .ok()
-        .as_deref()
-        == Some("1")
+    std::env::var("RUN_PURROUTE_INTEGRATION").ok().as_deref() == Some("1")
 }
 
 fn integration_stack_ready() -> bool {

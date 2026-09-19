@@ -43,43 +43,43 @@ fn protocol_from_str(s: &str) -> Protocol {
 /// Called by `row_to_proxy` with values extracted from a `tokio_postgres::Row`,
 /// and directly by unit tests.
 #[allow(clippy::allow_attributes, dead_code, clippy::too_many_arguments)]
-    fn build_proxy(
-        label: Option<String>,
-        proxy_type: &str,
-        address: String,
-        port: Option<i32>,
-        username: Option<String>,
-        password: Option<String>,
-        country: Option<String>,
-        state: Option<String>,
-        city: Option<String>,
-        isp: Option<String>,
-        kind: Option<String>,
-        cost_per_byte: f64,
-        postal: Option<String>,
-        asn: Option<i32>,
-    ) -> ProxyConfig {
-        ProxyConfig {
-            label,
-            proxy_type: protocol_from_str(proxy_type),
-            address,
-            port: port.and_then(|p| u16::try_from(p).ok()),
-            port_range: None,
-            username,
-            password,
-            tags: Tags {
-                country,
-                state,
-                city,
-                isp,
-                kind,
-                postal,
-                asn: asn.and_then(|a| u32::try_from(a).ok()),
-            },
-            cost_per_byte,
-            username_prefixes: None,
-        }
+fn build_proxy(
+    label: Option<String>,
+    proxy_type: &str,
+    address: String,
+    port: Option<i32>,
+    username: Option<String>,
+    password: Option<String>,
+    country: Option<String>,
+    state: Option<String>,
+    city: Option<String>,
+    isp: Option<String>,
+    kind: Option<String>,
+    cost_per_byte: f64,
+    postal: Option<String>,
+    asn: Option<i32>,
+) -> ProxyConfig {
+    ProxyConfig {
+        label,
+        proxy_type: protocol_from_str(proxy_type),
+        address,
+        port: port.and_then(|p| u16::try_from(p).ok()),
+        port_range: None,
+        username,
+        password,
+        tags: Tags {
+            country,
+            state,
+            city,
+            isp,
+            kind,
+            postal,
+            asn: asn.and_then(|a| u32::try_from(a).ok()),
+        },
+        cost_per_byte,
+        username_prefixes: None,
     }
+}
 
 #[allow(clippy::allow_attributes, dead_code)]
 fn row_to_proxy(row: &Row) -> ProxyConfig {

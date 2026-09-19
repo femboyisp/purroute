@@ -221,10 +221,10 @@ fn parse_username_territory(username: &str) -> Result<(String, Selection), Routi
             other => other.to_string(),
         })
     })?;
-    Ok((base, routing_selection_to_sel(catmac::territory_to_selection(
-        territory.as_ref(),
-        &mods,
-    ))))
+    Ok((
+        base,
+        routing_selection_to_sel(catmac::territory_to_selection(territory.as_ref(), &mods)),
+    ))
 }
 
 fn routing_selection_to_sel(r: catmac::territory::RoutingSelection) -> Selection {
@@ -326,9 +326,7 @@ fn validate_selection(sel: &Selection) -> Result<(), RoutingError> {
 /// Clamp a session id to provider-safe `[A-Za-z0-9_]{1,25}`.
 fn clamp_session_id(s: &str) -> String {
     const MAX: usize = 25;
-    if !s.is_empty()
-        && s.len() <= MAX
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    if !s.is_empty() && s.len() <= MAX && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
         return s.to_owned();
     }
@@ -410,7 +408,7 @@ pub fn pick_index(len: usize, session: Option<&str>) -> Option<usize> {
     match session {
         Some(s) => Some((fnv1a(s) as usize) % len),
         None => {
-            use rand::Rng as _;
+            use rand::RngExt as _;
             Some(rand::rng().random_range(0..len))
         }
     }
@@ -503,7 +501,9 @@ mod tests {
     fn rejects_isp_without_country() {
         assert_eq!(
             parse_username("u-isp-comcast"),
-            Err(RoutingError::InvalidSelection("isp requires country".into()))
+            Err(RoutingError::InvalidSelection(
+                "isp requires country".into()
+            ))
         );
     }
 

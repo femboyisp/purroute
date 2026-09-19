@@ -268,7 +268,7 @@ impl ChainConnector {
     }
 
     fn parse_address(addr: &str) -> Result<(String, u16), ProxyError> {
-        crate::hidden::split_authority(addr, 80).map_err(|e| ProxyError::Protocol(e))
+        crate::hidden::split_authority(addr, 80).map_err(ProxyError::Protocol)
     }
 }
 

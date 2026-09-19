@@ -12,15 +12,6 @@ pub fn is_i2p(host: &str) -> bool {
     h.ends_with(".i2p") || h.ends_with(".b32.i2p")
 }
 
-/// Default port when none is specified for hidden-network hosts.
-pub fn default_port(host: &str) -> u16 {
-    if is_onion(host) || is_i2p(host) {
-        80
-    } else {
-        80
-    }
-}
-
 /// Split `authority` (`host` or `host:port`) using the last `:` as the port
 /// separator. IPv6 bracket form (`[::1]:9050`) is supported.
 pub fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {

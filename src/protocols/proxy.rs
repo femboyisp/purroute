@@ -102,16 +102,13 @@ impl ProxyServer {
         &self,
         hop: &crate::config::HiddenHopConfig,
         default_label: &str,
-        mut chain: Vec<ProxyConfig>,
+        chain: Vec<ProxyConfig>,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
         if !hop.enabled || !hop.auto_prepend {
             return Ok(chain);
         }
         let label = hop.proxy_label.as_deref().unwrap_or(default_label);
-        if chain
-            .iter()
-            .any(|p| p.label.as_deref() == Some(label))
-        {
+        if chain.iter().any(|p| p.label.as_deref() == Some(label)) {
             return Ok(chain);
         }
         let proxies = self.proxy.load();
@@ -393,8 +390,8 @@ impl ProxyServer {
 
             let raw_username = username.clone();
             let scope = crate::routing::auth_scope(&raw_username);
-            let (username, sel) =
-                crate::routing::parse_username(&raw_username).map_err(|_| ProxyError::AuthFailed)?;
+            let (username, sel) = crate::routing::parse_username(&raw_username)
+                .map_err(|_| ProxyError::AuthFailed)?;
             selection = sel;
             let account = self
                 .auth
@@ -1266,8 +1263,7 @@ fn peek_target_host(protocol: &Proxy, request: &[u8]) -> Option<String> {
 /// Split an `authority` (`host` or `host:port`) into host and port, using
 /// `default_port` when none is present.
 fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16), ProxyError> {
-    crate::hidden::split_authority(authority, default_port)
-        .map_err(|e| ProxyError::Protocol(e))
+    crate::hidden::split_authority(authority, default_port).map_err(ProxyError::Protocol)
 }
 
 /// Extract the username from an HTTP `Proxy-Authorization: Basic` header.
@@ -1603,9 +1599,11 @@ mod loopback {
 
     #[test]
     fn onion_target_prepends_tor_hop() {
-        let mut tor_cfg = crate::config::HiddenHopConfig::default();
-        tor_cfg.enabled = true;
-        tor_cfg.auto_prepend = true;
+        let tor_cfg = crate::config::HiddenHopConfig {
+            enabled: true,
+            auto_prepend: true,
+            ..Default::default()
+        };
         let router = RouterConfig {
             chain: Some("residential".into()),
             auth: Some(false),

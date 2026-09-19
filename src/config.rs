@@ -213,9 +213,9 @@ pub fn parse_endpoint_address(
         let start: u16 = start.parse().map_err(|_| {
             ConfigError::Endpoint(format!("invalid port range start in '{address}'"))
         })?;
-        let end: u16 = end.parse().map_err(|_| {
-            ConfigError::Endpoint(format!("invalid port range end in '{address}'"))
-        })?;
+        let end: u16 = end
+            .parse()
+            .map_err(|_| ConfigError::Endpoint(format!("invalid port range end in '{address}'")))?;
         if start > end {
             return Err(ConfigError::Endpoint(format!(
                 "invalid port range in '{address}': start > end"
