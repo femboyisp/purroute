@@ -399,6 +399,50 @@ pub fn pick_port(range: (u16, u16), session: Option<&str>) -> u16 {
     range.0.saturating_add(idx as u16)
 }
 
+/// Pick one port from an inclusive range with health awareness and exclusion filtering.
+/// In rotating mode, picks randomly from candidate healthy ports.
+/// In sticky mode, selects the primary hashed port if healthy, or deterministically
+/// maps across candidate healthy ports to maintain consistency during outages.
+pub fn pick_port_healthy(
+    host: &str,
+    range: (u16, u16),
+    session: Option<&str>,
+    tracker: &crate::health::UpstreamHealthTracker,
+    excluded_ports: &[u16],
+) -> u16 {
+    let healthy_ports = tracker.get_healthy_ports(host, range);
+    let mut candidates: Vec<u16> = healthy_ports
+        .into_iter()
+        .filter(|p| !excluded_ports.contains(p))
+        .collect();
+
+    if candidates.is_empty() {
+        // Fallback: ignore excluded_ports if all healthy ports were excluded
+        candidates = tracker.get_healthy_ports(host, range);
+    }
+
+    match session {
+        None => {
+            use rand::seq::IndexedRandom as _;
+            let mut rng = rand::rng();
+            *candidates.choose(&mut rng).unwrap_or(&range.0)
+        }
+        Some(s) => {
+            let total_range_len = usize::from(range.1.saturating_sub(range.0)) + 1;
+            let primary_offset = (fnv1a(s) as usize) % total_range_len;
+            let primary_port = range.0.saturating_add(primary_offset as u16);
+
+            if candidates.contains(&primary_port) {
+                primary_port
+            } else {
+                // Primary is dead or excluded: deterministically pick from healthy candidates
+                let idx = (fnv1a(s) as usize) % candidates.len();
+                candidates[idx]
+            }
+        }
+    }
+}
+
 /// Pick one index into `len` candidates: deterministic by `session` (sticky),
 /// otherwise random (rotate). Returns `None` when `len == 0`.
 pub fn pick_index(len: usize, session: Option<&str>) -> Option<usize> {
@@ -566,6 +610,49 @@ mod tests {
         // No session => valid index in range.
         assert!(pick_index(3, None).unwrap() < 3);
         assert_eq!(pick_index(0, None), None);
+    }
+
+    #[test]
+    fn pick_port_healthy_bypasses_dead_and_excluded_ports() {
+        use crate::config::UpstreamHealthConfig;
+        use crate::health::UpstreamHealthTracker;
+
+        let tracker = UpstreamHealthTracker::new(UpstreamHealthConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        });
+        tracker.record_failure("proxy.socks.cat", 11002);
+
+        let range = (11000, 11005);
+        // 11002 is dead, 11001 is dynamically excluded
+        for _ in 0..20 {
+            let p = pick_port_healthy("proxy.socks.cat", range, None, &tracker, &[11001]);
+            assert!(p != 11002 && p != 11001);
+            assert!((11000..=11005).contains(&p));
+        }
+    }
+
+    #[test]
+    fn pick_port_healthy_sticky_deterministic_fallback() {
+        use crate::config::UpstreamHealthConfig;
+        use crate::health::UpstreamHealthTracker;
+
+        let tracker = UpstreamHealthTracker::new(UpstreamHealthConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        });
+
+        let range = (11000, 11005);
+        let normal = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+
+        // Mark that chosen port dead:
+        tracker.record_failure("proxy.socks.cat", normal);
+
+        let fallback_1 = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+        let fallback_2 = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+
+        assert_ne!(normal, fallback_1);
+        assert_eq!(fallback_1, fallback_2); // Consistent fallback across requests!
     }
 
     #[test]
