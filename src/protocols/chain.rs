@@ -22,6 +22,7 @@ impl ChainConnector {
     ///
     /// # Returns
     /// The TCP stream connected to the final destination through the chain
+    #[expect(dead_code)]
     pub async fn connect_chain(
         chain: &[ProxyConfig],
         target_host: &str,

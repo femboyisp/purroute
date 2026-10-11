@@ -129,6 +129,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Spawn the active background health prober if recovery_mode is "active".
+    if router_config.upstream_health.recovery_mode == "active" {
+        let tracker = server.health_tracker();
+        let configured_proxies = static_proxies.clone();
+        tokio::spawn(async move {
+            crate::health::run_active_health_prober(tracker, configured_proxies).await;
+        });
+    }
+
     // Run the stats display in a separate task.
     let display_handle = tokio::spawn({
         let display = StatsDisplay::new(

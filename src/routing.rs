@@ -393,6 +393,7 @@ pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Sel
 }
 
 /// Pick one port from an inclusive range: sticky by `session`, else random.
+#[expect(dead_code)]
 pub fn pick_port(range: (u16, u16), session: Option<&str>) -> u16 {
     let len = u32::from(range.1.saturating_sub(range.0)) + 1;
     let idx = pick_index(len as usize, session).unwrap_or(0);

@@ -147,6 +147,7 @@ impl ProxyServer {
     /// Resolve the upstream chain for a connection, honouring a routing
     /// [`Selection`] when it constrains location/ISP/type; otherwise the global
     /// `[router].chain`.
+    #[expect(dead_code)]
     fn resolve_proxy_chain(
         &self,
         selection: &crate::routing::Selection,
