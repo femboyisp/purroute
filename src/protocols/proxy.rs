@@ -45,6 +45,7 @@ pub struct ProxyServer {
     chains: Arc<Option<Vec<ChainConfig>>>,
     config: Arc<RouterConfig>,
     auth: Arc<dyn AuthBackend>,
+    health: Arc<crate::health::UpstreamHealthTracker>,
 }
 
 impl ProxyServer {
@@ -55,12 +56,20 @@ impl ProxyServer {
         config: Arc<RouterConfig>,
         auth: Arc<dyn AuthBackend>,
     ) -> Self {
+        let health = Arc::new(crate::health::UpstreamHealthTracker::new(
+            config.upstream_health.clone(),
+        ));
         Self {
             proxy: Arc::new(ArcSwap::from_pointee(proxy)),
             chains: Arc::new(chains),
             config,
             auth,
+            health,
         }
+    }
+
+    pub fn health_tracker(&self) -> Arc<crate::health::UpstreamHealthTracker> {
+        Arc::clone(&self.health)
     }
 
     /// Replace the live upstream set with `static_upstreams` followed by
@@ -80,7 +89,16 @@ impl ProxyServer {
         selection: &crate::routing::Selection,
         target_host: &str,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        let chain = self.resolve_proxy_chain(selection)?;
+        self.resolve_proxy_chain_for_target_excluded(selection, target_host, &[])
+    }
+
+    fn resolve_proxy_chain_for_target_excluded(
+        &self,
+        selection: &crate::routing::Selection,
+        target_host: &str,
+        excluded_ports: &[u16],
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        let chain = self.resolve_proxy_chain_excluded(selection, excluded_ports)?;
         self.prepend_hidden_hops(chain, target_host)
     }
 
@@ -133,12 +151,23 @@ impl ProxyServer {
         &self,
         selection: &crate::routing::Selection,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        self.resolve_proxy_chain_excluded(selection, &[])
+    }
+
+    fn resolve_proxy_chain_excluded(
+        &self,
+        selection: &crate::routing::Selection,
+        excluded_ports: &[u16],
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
         let mut chain = self.resolve_chain_inner(selection)?;
         for p in &mut chain {
             if let Some(range) = p.port_range {
-                p.port = Some(crate::routing::pick_port(
+                p.port = Some(crate::routing::pick_port_healthy(
+                    &p.address,
                     range,
                     selection.session.as_deref(),
+                    &self.health,
+                    excluded_ports,
                 ));
             }
             if let Some(prefixes) = &p.username_prefixes {
@@ -488,11 +517,51 @@ impl ProxyServer {
         }
 
         // Resolve the upstream by the selection (single- or multi-hop), then tunnel.
-        let proxy_chain = self.resolve_proxy_chain_for_target(&selection, &target_host)?;
-        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
-        metrics::histogram!("purroute_chain_hops").record(proxy_chain.len() as f64);
-        let upstream =
-            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+        // Attempt connect with retry loop over excluded failed ports
+        let max_retries = self.config.upstream_health.max_retries;
+        let mut excluded_ports = Vec::new();
+        let mut last_err = None;
+        let mut connected_upstream = None;
+        let mut final_chain = Vec::new();
+
+        for attempt in 0..=max_retries {
+            let proxy_chain = match self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            };
+
+            match ChainConnector::connect_chain_with_health(&proxy_chain, &target_host, target_port, Some(&self.health)).await {
+                Ok(u) => {
+                    if attempt > 0 {
+                        metrics::counter!("purroute_upstream_retries_total").increment(1);
+                        metrics::counter!("purroute_upstream_failover_success_total").increment(1);
+                    }
+                    connected_upstream = Some(u);
+                    final_chain = proxy_chain;
+                    break;
+                }
+                Err(e) => {
+                    if let Some(first) = proxy_chain.first() {
+                        if let Some(port) = first.port {
+                            excluded_ports.push(port);
+                        }
+                    }
+                    metrics::counter!("purroute_upstream_retries_total").increment(1);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let upstream = match connected_upstream {
+            Some(u) => u,
+            None => return Err(last_err.unwrap_or(ProxyError::Timeout)),
+        };
+
+        let cost_per_byte = final_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
+        metrics::histogram!("purroute_chain_hops").record(final_chain.len() as f64);
 
         // Send success response to client
         let response = [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -532,10 +601,48 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_socks4_target(&initial_request)?;
-        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
+        let mut excluded_ports = Vec::new();
+        let mut connected_upstream = None;
+        let mut final_chain = proxy_chain.clone();
+        let mut last_err = None;
+        let max_retries = self.config.upstream_health.max_retries;
 
-        let upstream =
-            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+        for attempt in 0..=max_retries {
+            let chain_candidate = if attempt == 0 {
+                proxy_chain.clone()
+            } else {
+                let selection = self.selection_for(&Proxy::Socks4, &initial_request, peer_addr).await;
+                self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports)?
+            };
+
+            match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
+                Ok(u) => {
+                    if attempt > 0 {
+                        metrics::counter!("purroute_upstream_retries_total").increment(1);
+                        metrics::counter!("purroute_upstream_failover_success_total").increment(1);
+                    }
+                    connected_upstream = Some(u);
+                    final_chain = chain_candidate;
+                    break;
+                }
+                Err(e) => {
+                    if let Some(first) = chain_candidate.first() {
+                        if let Some(port) = first.port {
+                            excluded_ports.push(port);
+                        }
+                    }
+                    metrics::counter!("purroute_upstream_retries_total").increment(1);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let upstream = match connected_upstream {
+            Some(u) => u,
+            None => return Err(last_err.unwrap_or(ProxyError::Timeout)),
+        };
+
+        let cost_per_byte = final_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         // SOCKS4 success reply: VN=0x00, CD=0x5A (granted), 6 bytes ignored.
         let response = [0x00, 0x5A, 0, 0, 0, 0, 0, 0];
@@ -572,10 +679,49 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_connect_target(&initial_request)?;
-        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
-        let upstream =
-            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+        let mut excluded_ports = Vec::new();
+        let mut connected_upstream = None;
+        let mut final_chain = proxy_chain.clone();
+        let mut last_err = None;
+        let max_retries = self.config.upstream_health.max_retries;
+
+        for attempt in 0..=max_retries {
+            let chain_candidate = if attempt == 0 {
+                proxy_chain.clone()
+            } else {
+                let selection = self.selection_for(&Proxy::Https, &initial_request, peer_addr).await;
+                self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports)?
+            };
+
+            match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
+                Ok(u) => {
+                    if attempt > 0 {
+                        metrics::counter!("purroute_upstream_retries_total").increment(1);
+                        metrics::counter!("purroute_upstream_failover_success_total").increment(1);
+                    }
+                    connected_upstream = Some(u);
+                    final_chain = chain_candidate;
+                    break;
+                }
+                Err(e) => {
+                    if let Some(first) = chain_candidate.first() {
+                        if let Some(port) = first.port {
+                            excluded_ports.push(port);
+                        }
+                    }
+                    metrics::counter!("purroute_upstream_retries_total").increment(1);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let upstream = match connected_upstream {
+            Some(u) => u,
+            None => return Err(last_err.unwrap_or(ProxyError::Timeout)),
+        };
+
+        let cost_per_byte = final_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
         client.write_all(response).await?;
@@ -612,10 +758,49 @@ impl ProxyServer {
 
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_http_target(&initial_request)?;
-        let cost_per_byte = proxy_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
-        let mut upstream =
-            ChainConnector::connect_chain(&proxy_chain, &target_host, target_port).await?;
+        let mut excluded_ports = Vec::new();
+        let mut connected_upstream = None;
+        let mut final_chain = proxy_chain.clone();
+        let mut last_err = None;
+        let max_retries = self.config.upstream_health.max_retries;
+
+        for attempt in 0..=max_retries {
+            let chain_candidate = if attempt == 0 {
+                proxy_chain.clone()
+            } else {
+                let selection = self.selection_for(&Proxy::Http, &initial_request, peer_addr).await;
+                self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports)?
+            };
+
+            match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
+                Ok(u) => {
+                    if attempt > 0 {
+                        metrics::counter!("purroute_upstream_retries_total").increment(1);
+                        metrics::counter!("purroute_upstream_failover_success_total").increment(1);
+                    }
+                    connected_upstream = Some(u);
+                    final_chain = chain_candidate;
+                    break;
+                }
+                Err(e) => {
+                    if let Some(first) = chain_candidate.first() {
+                        if let Some(port) = first.port {
+                            excluded_ports.push(port);
+                        }
+                    }
+                    metrics::counter!("purroute_upstream_retries_total").increment(1);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let mut upstream = match connected_upstream {
+            Some(u) => u,
+            None => return Err(last_err.unwrap_or(ProxyError::Timeout)),
+        };
+
+        let cost_per_byte = final_chain.first().map(|p| p.cost_per_byte).unwrap_or(1.0);
 
         // Forward the request to the origin server through the chain, rewriting
         // the absolute-form request line to origin-form so strict origins accept it.
@@ -2988,5 +3173,97 @@ mod proxy_cov2 {
             0,
             "handle_web_backend must decrement active_connections exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_retry_on_dead_port() {
+        use crate::config::{ProxyConfig, Tags};
+
+        // Search for two adjacent ports
+        let (l1_listener, l2_listener, p_start, p_end) = {
+            let mut found = None;
+            for candidate in 20000..30000 {
+                if let Ok(l_a) = TcpListener::bind(format!("127.0.0.1:{}", candidate)).await {
+                    if let Ok(l_b) = TcpListener::bind(format!("127.0.0.1:{}", candidate + 1)).await {
+                        found = Some((l_a, l_b, candidate, candidate + 1));
+                        break;
+                    }
+                }
+            }
+            found.expect("failed to find two consecutive ports")
+        };
+
+        // Upstream 1 hangs on p_start
+        tokio::spawn(async move {
+            while let Ok((_s, _)) = l1_listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        // Upstream 2 responds OK on p_end
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l2_listener.accept().await {
+                s5_greeting(&mut s).await;
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let _ = s5_connect(&mut s).await;
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY2.len(),
+                    BODY2
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+            }
+        });
+
+        let mut proxy = ProxyConfig {
+            label: Some("retrying-upstream".into()),
+            proxy_type: Proxy::Socks5,
+            address: format!("127.0.0.1:{}-{}", p_start, p_end),
+            port: None,
+            port_range: None,
+            username: None,
+            password: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            username_prefixes: None,
+        };
+        crate::config::normalize_proxy_endpoints(std::slice::from_mut(&mut proxy)).unwrap();
+
+        let mut router_cfg = RouterConfig::default();
+        router_cfg.upstream_health.handshake_timeout_secs = 1;
+        router_cfg.upstream_health.max_retries = 2;
+        router_cfg.chain = Some("retrying-upstream".into());
+
+        let srv = Arc::new(ProxyServer::new(
+            vec![proxy],
+            None,
+            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(router_cfg),
+            Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
+        ));
+
+        // Mark p_start as dead so routing fails over or retries
+        srv.health.record_failure("127.0.0.1", p_start);
+
+        let front = serve1((*srv).clone()).await;
+        let mut client = TcpStream::connect(front).await.unwrap();
+
+        // Send SOCKS5 greeting
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut sel = [0u8; 2];
+        client.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x00]);
+
+        // SOCKS5 connect to 127.0.0.1:80
+        client.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80]).await.unwrap();
+        let mut rep = [0u8; 10];
+        client.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00, "Connection should succeed via retry");
     }
 }

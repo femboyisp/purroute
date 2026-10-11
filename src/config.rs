@@ -287,7 +287,7 @@ pub fn parse_endpoint_address(
     Ok((host.to_owned(), Some(port), None))
 }
 
-fn normalize_proxy_endpoints(proxies: &mut [ProxyConfig]) -> Result<(), ConfigError> {
+pub(crate) fn normalize_proxy_endpoints(proxies: &mut [ProxyConfig]) -> Result<(), ConfigError> {
     for p in proxies.iter_mut() {
         let port = p.port;
         let (host, single, range) = parse_endpoint_address(&p.address, port)?;
