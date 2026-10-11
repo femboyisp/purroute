@@ -85,6 +85,63 @@ pub struct RouterConfig {
     /// I2P (.i2p) routing: optional local SOCKS hop + auto-prepend for I2P targets.
     #[serde(default)]
     pub i2p: HiddenHopConfig,
+    /// Upstream health tracking and failover retry settings.
+    #[serde(default)]
+    pub upstream_health: UpstreamHealthConfig,
+}
+
+/// Upstream port health tracking, retries, and failover configuration.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct UpstreamHealthConfig {
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_recovery_mode")]
+    pub recovery_mode: String,
+    #[serde(default = "default_active_probe_interval_secs")]
+    pub active_probe_interval_secs: u64,
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    3
+}
+
+fn default_max_retries() -> usize {
+    2
+}
+
+fn default_failure_threshold() -> u32 {
+    2
+}
+
+fn default_cooldown_secs() -> u64 {
+    45
+}
+
+fn default_recovery_mode() -> String {
+    "active".to_string()
+}
+
+fn default_active_probe_interval_secs() -> u64 {
+    30
+}
+
+impl Default for UpstreamHealthConfig {
+    fn default() -> Self {
+        Self {
+            handshake_timeout_secs: default_handshake_timeout_secs(),
+            max_retries: default_max_retries(),
+            failure_threshold: default_failure_threshold(),
+            cooldown_secs: default_cooldown_secs(),
+            recovery_mode: default_recovery_mode(),
+            active_probe_interval_secs: default_active_probe_interval_secs(),
+        }
+    }
 }
 
 /// Local Tor/I2P SOCKS hop used to reach hidden-network destinations.
@@ -119,6 +176,7 @@ impl Default for RouterConfig {
             auth_grace_secs: default_auth_grace_secs(),
             tor: HiddenHopConfig::default(),
             i2p: HiddenHopConfig::default(),
+            upstream_health: UpstreamHealthConfig::default(),
         }
     }
 }
@@ -565,5 +623,40 @@ address = "10.0.0.1"
 "#;
         let cfg: Config = toml::from_str(toml_without).unwrap();
         assert_eq!(cfg.router.web_backend, None);
+    }
+
+    #[test]
+    fn test_upstream_health_config_defaults() {
+        let toml = r#"
+            listen = "127.0.0.1:1080"
+        "#;
+        let router: RouterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(router.upstream_health.handshake_timeout_secs, 3);
+        assert_eq!(router.upstream_health.max_retries, 2);
+        assert_eq!(router.upstream_health.failure_threshold, 2);
+        assert_eq!(router.upstream_health.cooldown_secs, 45);
+        assert_eq!(router.upstream_health.recovery_mode, "active");
+        assert_eq!(router.upstream_health.active_probe_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_upstream_health_config_custom() {
+        let toml = r#"
+            listen = "127.0.0.1:1080"
+            [upstream_health]
+            handshake_timeout_secs = 5
+            max_retries = 3
+            failure_threshold = 1
+            cooldown_secs = 60
+            recovery_mode = "passive"
+            active_probe_interval_secs = 15
+        "#;
+        let router: RouterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(router.upstream_health.handshake_timeout_secs, 5);
+        assert_eq!(router.upstream_health.max_retries, 3);
+        assert_eq!(router.upstream_health.failure_threshold, 1);
+        assert_eq!(router.upstream_health.cooldown_secs, 60);
+        assert_eq!(router.upstream_health.recovery_mode, "passive");
+        assert_eq!(router.upstream_health.active_probe_interval_secs, 15);
     }
 }
