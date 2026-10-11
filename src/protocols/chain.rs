@@ -27,16 +27,47 @@ impl ChainConnector {
         target_host: &str,
         target_port: u16,
     ) -> Result<TcpStream, ProxyError> {
+        Self::connect_chain_with_health(chain, target_host, target_port, None).await
+    }
+
+    /// Connect through a chain of proxies with optional health tracking and bounded timeout.
+    pub async fn connect_chain_with_health(
+        chain: &[ProxyConfig],
+        target_host: &str,
+        target_port: u16,
+        health_tracker: Option<&crate::health::UpstreamHealthTracker>,
+    ) -> Result<TcpStream, ProxyError> {
         if chain.is_empty() {
             return Err(ProxyError::Protocol("Empty proxy chain".to_string()));
         }
 
         let _stats = get_global_stats();
+        let timeout_secs = health_tracker
+            .map(|t| t.config().handshake_timeout_secs)
+            .unwrap_or(30);
 
         // Connect to first proxy in chain
         let first_proxy = &chain[0];
-        let mut stream = TcpStream::connect(first_proxy.get_upstream_addr()).await?;
-        stream.set_nodelay(true)?; // Disable Nagle's algorithm for lower latency
+        let first_addr = first_proxy.get_upstream_addr();
+        let (first_host, first_port) = Self::parse_address(&first_addr)?;
+
+        let connect_fut = TcpStream::connect(&first_addr);
+        let mut stream = match timeout(Duration::from_secs(timeout_secs), connect_fut).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                if let Some(tracker) = health_tracker {
+                    tracker.record_failure(&first_host, first_port);
+                }
+                return Err(ProxyError::Io(e));
+            }
+            Err(_) => {
+                if let Some(tracker) = health_tracker {
+                    tracker.record_failure(&first_host, first_port);
+                }
+                return Err(ProxyError::Timeout);
+            }
+        };
+        stream.set_nodelay(true)?;
 
         // For each proxy in the chain, establish connection to the next hop
         for (i, current_proxy) in chain.iter().enumerate() {
@@ -51,9 +82,30 @@ impl ChainConnector {
                 Self::parse_address(&next_proxy.get_upstream_addr())?
             };
 
-            // Establish connection through current proxy to next hop
-            stream =
-                Self::connect_through_proxy(stream, current_proxy, &next_host, next_port).await?;
+            let (curr_host, curr_port) = Self::parse_address(&current_proxy.get_upstream_addr())?;
+            let handshake_fut =
+                Self::connect_through_proxy(stream, current_proxy, &next_host, next_port);
+
+            match timeout(Duration::from_secs(timeout_secs), handshake_fut).await {
+                Ok(Ok(s)) => {
+                    if let Some(tracker) = health_tracker {
+                        tracker.record_success(&curr_host, curr_port);
+                    }
+                    stream = s;
+                }
+                Ok(Err(e)) => {
+                    if let Some(tracker) = health_tracker {
+                        tracker.record_failure(&curr_host, curr_port);
+                    }
+                    return Err(e);
+                }
+                Err(_) => {
+                    if let Some(tracker) = health_tracker {
+                        tracker.record_failure(&curr_host, curr_port);
+                    }
+                    return Err(ProxyError::Timeout);
+                }
+            }
         }
 
         Ok(stream)
@@ -791,5 +843,42 @@ mod chain_cov {
             ProxyError::Protocol(m) => assert!(m.contains("invalid port")),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_chain_handshake_timeout() {
+        use crate::config::UpstreamHealthConfig;
+        use crate::health::UpstreamHealthTracker;
+        use std::sync::Arc;
+
+        // Server accepts TCP connection but never sends any SOCKS response bytes
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_s, _)) = l.accept().await {
+                // hang forever
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        let tracker = Arc::new(UpstreamHealthTracker::new(UpstreamHealthConfig {
+            handshake_timeout_secs: 1,
+            failure_threshold: 1,
+            ..Default::default()
+        }));
+
+        let chain = vec![cfg(Protocol::Socks5, addr)];
+        let (host, port) = ChainConnector::parse_address(&chain[0].get_upstream_addr()).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let err = ChainConnector::connect_chain_with_health(&chain, "x", 80, Some(&tracker))
+            .await
+            .unwrap_err();
+
+        // Must time out fast (~1s) instead of 30s
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3));
+        assert!(matches!(err, ProxyError::Timeout | ProxyError::Protocol(_)));
+        // Port must be marked dead in tracker
+        assert!(!tracker.is_healthy(&host, port));
     }
 }
