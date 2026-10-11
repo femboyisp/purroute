@@ -17,6 +17,7 @@ use tokio_postgres::{Client, Config as PgConfig, NoTls};
 
 mod auth;
 mod config;
+mod health;
 mod hidden;
 mod protocol;
 mod protocols;
