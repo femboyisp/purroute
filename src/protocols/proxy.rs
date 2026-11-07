@@ -89,7 +89,7 @@ impl ProxyServer {
         selection: &crate::routing::Selection,
         target_host: &str,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        self.resolve_proxy_chain_for_target_excluded(selection, target_host, &[])
+        self.resolve_proxy_chain_for_target_excluded(selection, target_host, &[], &[])
     }
 
     fn resolve_proxy_chain_for_target_excluded(
@@ -97,8 +97,9 @@ impl ProxyServer {
         selection: &crate::routing::Selection,
         target_host: &str,
         excluded_ports: &[u16],
+        excluded_endpoints: &[(String, u16)],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        let chain = self.resolve_proxy_chain_excluded(selection, excluded_ports)?;
+        let chain = self.resolve_proxy_chain_excluded(selection, excluded_ports, excluded_endpoints)?;
         self.prepend_hidden_hops(chain, target_host)
     }
 
@@ -152,15 +153,16 @@ impl ProxyServer {
         &self,
         selection: &crate::routing::Selection,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        self.resolve_proxy_chain_excluded(selection, &[])
+        self.resolve_proxy_chain_excluded(selection, &[], &[])
     }
 
     fn resolve_proxy_chain_excluded(
         &self,
         selection: &crate::routing::Selection,
         excluded_ports: &[u16],
+        excluded_endpoints: &[(String, u16)],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        let mut chain = self.resolve_chain_inner_excluded(selection, excluded_ports)?;
+        let mut chain = self.resolve_chain_inner_excluded(selection, excluded_ports, excluded_endpoints)?;
         for p in &mut chain {
             if let Some(range) = p.port_range {
                 p.port = Some(crate::routing::pick_port_healthy(
@@ -198,13 +200,14 @@ impl ProxyServer {
         &self,
         selection: &crate::routing::Selection,
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        self.resolve_chain_inner_excluded(selection, &[])
+        self.resolve_chain_inner_excluded(selection, &[], &[])
     }
 
     fn resolve_chain_inner_excluded(
         &self,
         selection: &crate::routing::Selection,
         excluded_ports: &[u16],
+        excluded_endpoints: &[(String, u16)],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
         // An explicit `chain` selection names a `[[proxy]]` label or `[[chain]]`
         // id directly and takes precedence over the tag dimensions.
@@ -252,8 +255,13 @@ impl ProxyServer {
                 .iter()
                 .filter(|p| {
                     if let Some(port) = p.port {
-                        if p.port_range.is_none() && excluded_ports.contains(&port) {
-                            return false;
+                        if p.port_range.is_none() {
+                            if excluded_endpoints.iter().any(|(addr, pt)| addr == &p.address && *pt == port) {
+                                return false;
+                            }
+                            if excluded_endpoints.is_empty() && excluded_ports.contains(&port) {
+                                return false;
+                            }
                         }
                     }
                     true
@@ -271,19 +279,20 @@ impl ProxyServer {
                 .ok_or(ProxyError::NoMatchingUpstream)?;
             return Ok(vec![active_candidates[idx].clone()]);
         }
-        self.resolve_global_chain_excluded(excluded_ports)
+        self.resolve_global_chain_excluded(excluded_ports, excluded_endpoints)
     }
 
     /// The original global resolution: a single `[[proxy]]` by label or a
     /// `[[chain]]` by id, used when no location/ISP selection is given.
     #[allow(clippy::allow_attributes, dead_code)]
     fn resolve_global_chain(&self) -> Result<Vec<ProxyConfig>, ProxyError> {
-        self.resolve_global_chain_excluded(&[])
+        self.resolve_global_chain_excluded(&[], &[])
     }
 
     fn resolve_global_chain_excluded(
         &self,
         excluded_ports: &[u16],
+        excluded_endpoints: &[(String, u16)],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
         // If router.chain names a proxy/chain, resolve it; else fall back to the
         // first configured proxy (backward compatibility).
@@ -299,8 +308,13 @@ impl ProxyServer {
             .iter()
             .filter(|p| {
                 if let Some(port) = p.port {
-                    if p.port_range.is_none() && excluded_ports.contains(&port) {
-                        return false;
+                    if p.port_range.is_none() {
+                        if excluded_endpoints.iter().any(|(addr, pt)| addr == &p.address && *pt == port) {
+                            return false;
+                        }
+                        if excluded_endpoints.is_empty() && excluded_ports.contains(&port) {
+                            return false;
+                        }
                     }
                 }
                 true
@@ -622,12 +636,18 @@ impl ProxyServer {
         // Attempt connect with retry loop over excluded failed ports
         let max_retries = self.config.upstream_health.max_retries;
         let mut excluded_ports = Vec::new();
+        let mut excluded_endpoints = Vec::new();
         let mut last_err = None;
         let mut connected_upstream = None;
         let mut final_chain = Vec::new();
 
         for attempt in 0..=max_retries {
-            let proxy_chain = match self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports) {
+            let proxy_chain = match self.resolve_proxy_chain_for_target_excluded(
+                &selection,
+                &target_host,
+                &excluded_ports,
+                &excluded_endpoints,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     last_err = Some(e);
@@ -648,7 +668,11 @@ impl ProxyServer {
                 Err(e) => {
                     if let Some(first) = proxy_chain.first() {
                         if let Some(port) = first.port {
-                            excluded_ports.push(port);
+                            if first.port_range.is_some() {
+                                excluded_ports.push(port);
+                            } else {
+                                excluded_endpoints.push((first.address.clone(), port));
+                            }
                         }
                     }
                     metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -704,6 +728,7 @@ impl ProxyServer {
         let user_account = self.authenticate_user(&initial_request, peer_addr).await?;
         let (target_host, target_port) = parse_socks4_target(&initial_request)?;
         let mut excluded_ports = Vec::new();
+        let mut excluded_endpoints = Vec::new();
         let mut connected_upstream = None;
         let mut final_chain = proxy_chain.clone();
         let mut last_err = None;
@@ -714,7 +739,12 @@ impl ProxyServer {
                 proxy_chain.clone()
             } else {
                 let selection = self.selection_for(&Proxy::Socks4, &initial_request, peer_addr).await;
-                self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports)?
+                self.resolve_proxy_chain_for_target_excluded(
+                    &selection,
+                    &target_host,
+                    &excluded_ports,
+                    &excluded_endpoints,
+                )?
             };
 
             match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
@@ -730,7 +760,11 @@ impl ProxyServer {
                 Err(e) => {
                     if let Some(first) = chain_candidate.first() {
                         if let Some(port) = first.port {
-                            excluded_ports.push(port);
+                            if first.port_range.is_some() {
+                                excluded_ports.push(port);
+                            } else {
+                                excluded_endpoints.push((first.address.clone(), port));
+                            }
                         }
                     }
                     metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -783,6 +817,7 @@ impl ProxyServer {
         let (target_host, target_port) = parse_connect_target(&initial_request)?;
 
         let mut excluded_ports = Vec::new();
+        let mut excluded_endpoints = Vec::new();
         let mut connected_upstream = None;
         let mut final_chain = proxy_chain.clone();
         let mut last_err = None;
@@ -793,7 +828,12 @@ impl ProxyServer {
                 proxy_chain.clone()
             } else {
                 let selection = self.selection_for(&Proxy::Https, &initial_request, peer_addr).await;
-                self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports)?
+                self.resolve_proxy_chain_for_target_excluded(
+                    &selection,
+                    &target_host,
+                    &excluded_ports,
+                    &excluded_endpoints,
+                )?
             };
 
             match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
@@ -809,7 +849,11 @@ impl ProxyServer {
                 Err(e) => {
                     if let Some(first) = chain_candidate.first() {
                         if let Some(port) = first.port {
-                            excluded_ports.push(port);
+                            if first.port_range.is_some() {
+                                excluded_ports.push(port);
+                            } else {
+                                excluded_endpoints.push((first.address.clone(), port));
+                            }
                         }
                     }
                     metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -862,6 +906,7 @@ impl ProxyServer {
         let (target_host, target_port) = parse_http_target(&initial_request)?;
 
         let mut excluded_ports = Vec::new();
+        let mut excluded_endpoints = Vec::new();
         let mut connected_upstream = None;
         let mut final_chain = proxy_chain.clone();
         let mut last_err = None;
@@ -872,7 +917,12 @@ impl ProxyServer {
                 proxy_chain.clone()
             } else {
                 let selection = self.selection_for(&Proxy::Http, &initial_request, peer_addr).await;
-                self.resolve_proxy_chain_for_target_excluded(&selection, &target_host, &excluded_ports)?
+                self.resolve_proxy_chain_for_target_excluded(
+                    &selection,
+                    &target_host,
+                    &excluded_ports,
+                    &excluded_endpoints,
+                )?
             };
 
             match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
@@ -888,7 +938,11 @@ impl ProxyServer {
                 Err(e) => {
                     if let Some(first) = chain_candidate.first() {
                         if let Some(port) = first.port {
-                            excluded_ports.push(port);
+                            if first.port_range.is_some() {
+                                excluded_ports.push(port);
+                            } else {
+                                excluded_endpoints.push((first.address.clone(), port));
+                            }
                         }
                     }
                     metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -3408,7 +3462,7 @@ mod proxy_cov2 {
         sel.country = vec!["us".into()];
         sel.session = Some("sess456".into());
 
-        let chain = srv.resolve_proxy_chain_excluded(&sel, &[]).unwrap();
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[], &[]).unwrap();
         assert_eq!(
             chain[0].password.as_deref(),
             Some("secret_country-US_session-sess456")
@@ -3441,11 +3495,48 @@ mod proxy_cov2 {
         let sel = crate::routing::Selection::default();
 
         // Without excluded ports, picks priority 5 (p2, port 1081)
-        let chain = srv.resolve_proxy_chain_excluded(&sel, &[]).unwrap();
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[], &[]).unwrap();
         assert_eq!(chain[0].port, Some(1081));
 
         // When port 1081 fails, excludes it and fails over to p1 (port 1080)
-        let chain_retry = srv.resolve_proxy_chain_excluded(&sel, &[1081]).unwrap();
+        let chain_retry = srv.resolve_proxy_chain_excluded(&sel, &[1081], &[]).unwrap();
+        assert_eq!(chain_retry[0].port, Some(1080));
+    }
+
+    #[test]
+    fn test_resolve_chain_distinct_hosts_same_port_failover() {
+        use crate::config::RouterSelectionConfig;
+
+        let mut p1 = px("gw-a", Proxy::Socks5, "10.0.0.1:1080".parse().unwrap());
+        p1.priority = Some(10);
+        let mut p2 = px("gw-b", Proxy::Socks5, "10.0.0.2:1080".parse().unwrap());
+        p2.priority = Some(20);
+
+        let mut router_cfg = RouterConfig::default();
+        router_cfg.selection = Some(RouterSelectionConfig {
+            mode: "priority".into(),
+            pinned_label: None,
+        });
+
+        let srv = Arc::new(ProxyServer::new(
+            vec![p1, p2],
+            None,
+            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(router_cfg),
+            Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
+        ));
+
+        let sel = crate::routing::Selection::default();
+
+        // Both gateways share port 1080. Initially picks gw-a (priority 10)
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[], &[]).unwrap();
+        assert_eq!(chain[0].label.as_deref(), Some("gw-a"));
+        assert_eq!(chain[0].port, Some(1080));
+
+        // When gw-a (10.0.0.1:1080) fails, gw-b (10.0.0.2:1080) is NOT excluded despite sharing port 1080
+        let excluded_endpoints = vec![("10.0.0.1".to_string(), 1080)];
+        let chain_retry = srv.resolve_proxy_chain_excluded(&sel, &[], &excluded_endpoints).unwrap();
+        assert_eq!(chain_retry[0].label.as_deref(), Some("gw-b"));
         assert_eq!(chain_retry[0].port, Some(1080));
     }
 
@@ -3471,7 +3562,7 @@ mod proxy_cov2 {
         ));
 
         let sel = crate::routing::Selection::default();
-        let chain = srv.resolve_proxy_chain_excluded(&sel, &[]).unwrap();
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[], &[]).unwrap();
         assert_eq!(chain[0].label.as_deref(), Some("gw-b"));
     }
 

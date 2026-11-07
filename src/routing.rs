@@ -119,7 +119,7 @@ impl Selection {
             && (templated("city") || dim_ok(&self.city, &tags.city))
             && (templated("postal") || dim_ok(&self.postal, &tags.postal))
             && (templated("isp") || dim_ok(&self.isp, &tags.isp))
-            && dim_ok(&self.kind, &tags.kind)
+            && (templated("kind") || templated("type") || dim_ok(&self.kind, &tags.kind))
             && asn_ok(self.asn, tags.asn)
     }
 }
@@ -429,8 +429,20 @@ pub fn build_password(
     if let (Some(prefix), Some(i)) = (prefixes.get("isp"), selection.isp.first()) {
         tokens.push(format!("{}{}", prefix.trim_start_matches('-'), i));
     }
+    if let (Some(prefix), Some(k)) = (
+        prefixes.get("kind").or_else(|| prefixes.get("type")),
+        selection.kind.first(),
+    ) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), k));
+    }
     if let (Some(prefix), Some(s)) = (prefixes.get("session"), &selection.session) {
-        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), s));
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), clamp_session_id(s)));
+    }
+    if let (Some(prefix), Some(l)) = (prefixes.get("lifetime"), &selection.lifetime) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), l));
+    }
+    if let (Some(prefix), Some(st)) = (prefixes.get("strict"), &selection.strict) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), st));
     }
 
     if tokens.is_empty() {
@@ -508,7 +520,7 @@ pub fn pick_index(len: usize, session: Option<&str>) -> Option<usize> {
 }
 
 /// Small stable hash (FNV-1a, 64-bit) so the same session id pins the same exit.
-fn fnv1a(s: &str) -> u64 {
+pub fn fnv1a(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         hash ^= u64::from(*b);
@@ -544,11 +556,19 @@ pub fn pick_candidate_index(
         }
         _ => {
             // Weighted selection (default)
+            let total_weight: u32 = candidates.iter().map(|p| p.weight.unwrap_or(1).max(1)).sum();
             if let Some(sess) = &selection.session {
-                // Deterministic sticky selection using session hash
-                pick_index(candidates.len(), Some(sess))
+                // Deterministic sticky weighted selection using session hash
+                let mut hash_val = (fnv1a(sess) % (total_weight as u64)) as u32;
+                for (i, p) in candidates.iter().enumerate() {
+                    let w = p.weight.unwrap_or(1).max(1);
+                    if hash_val < w {
+                        return Some(i);
+                    }
+                    hash_val -= w;
+                }
+                Some(0)
             } else {
-                let total_weight: u32 = candidates.iter().map(|p| p.weight.unwrap_or(1).max(1)).sum();
                 let mut rng_val = rand::random::<u32>() % total_weight;
                 for (i, p) in candidates.iter().enumerate() {
                     let w = p.weight.unwrap_or(1).max(1);
@@ -1051,5 +1071,111 @@ mod tests {
             None,
             &auth_scope(username),
         ));
+    }
+
+    #[test]
+    fn test_pick_candidate_index_sticky_weighted_distribution() {
+        use crate::protocols::Proxy;
+
+        let p0 = ProxyConfig {
+            label: Some("heavy".into()),
+            proxy_type: Proxy::Socks5,
+            address: "10.0.0.1".into(),
+            port: Some(1080),
+            port_range: None,
+            username: None,
+            password: None,
+            token_delimiter: None,
+            username_prefixes: None,
+            password_prefixes: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            priority: None,
+            weight: Some(90),
+        };
+        let p1 = ProxyConfig {
+            label: Some("light".into()),
+            proxy_type: Proxy::Socks5,
+            address: "10.0.0.2".into(),
+            port: Some(1080),
+            port_range: None,
+            username: None,
+            password: None,
+            token_delimiter: None,
+            username_prefixes: None,
+            password_prefixes: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            priority: None,
+            weight: Some(10),
+        };
+        let candidates = vec![p0, p1];
+        let strategy = RouterSelectionConfig {
+            mode: "weighted".into(),
+            pinned_label: None,
+        };
+
+        let mut count0 = 0;
+        let mut count1 = 0;
+        let total = 1000;
+
+        for i in 0..total {
+            let sess = format!("session_key_{i}");
+            let mut sel = Selection::default();
+            sel.session = Some(sess.clone());
+
+            let idx1 = pick_candidate_index(&candidates, &sel, &strategy).unwrap();
+            let idx2 = pick_candidate_index(&candidates, &sel, &strategy).unwrap();
+            // Consistent stickiness
+            assert_eq!(idx1, idx2);
+
+            if idx1 == 0 {
+                count0 += 1;
+            } else {
+                count1 += 1;
+            }
+        }
+
+        // 90/10 distribution with 1000 trials should reliably land near 900 / 100
+        assert!(
+            count0 > 800,
+            "expected candidate 0 (weight 90) to get > 80% picks, got {count0}/{total}"
+        );
+        assert!(
+            count1 < 200,
+            "expected candidate 1 (weight 10) to get < 20% picks, got {count1}/{total}"
+        );
+    }
+
+    #[test]
+    fn test_build_password_session_sanitization() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("session".into(), "-session-".into());
+
+        let mut selection = Selection::default();
+        selection.session = Some("evil;pass_delims!@#".into());
+
+        let result = build_password("basepass", &prefixes, Some("_"), &selection);
+        // clamp_session_id should hash any string containing non-[A-Za-z0-9_] characters
+        assert!(!result.contains(';'));
+        assert!(!result.contains('!'));
+        assert!(!result.contains('@'));
+        assert!(result.starts_with("basepass_session-s"));
+    }
+
+    #[test]
+    fn test_build_password_kind_lifetime_strict() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("kind".into(), "-type-".into());
+        prefixes.insert("lifetime".into(), "-life-".into());
+        prefixes.insert("strict".into(), "-strict-".into());
+
+        let mut selection = Selection::default();
+        selection.kind = vec!["residential".into()];
+        selection.lifetime = Some("30".into());
+        selection.strict = Some("1".into());
+
+        let result = build_password("basepass", &prefixes, Some("_"), &selection);
+        assert_eq!(result, "basepass_type-residential_life-30_strict-1");
     }
 }
