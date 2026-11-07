@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::Tags;
+use crate::config::{ProxyConfig, RouterSelectionConfig, Tags};
 
 /// Recognised routing keys. The base username ends at the first one of these
 /// that is followed by a value.
@@ -517,9 +517,149 @@ fn fnv1a(s: &str) -> u64 {
     hash
 }
 
+/// Pick one upstream candidate index according to the configured selection strategy.
+pub fn pick_candidate_index(
+    candidates: &[ProxyConfig],
+    selection: &Selection,
+    strategy: &RouterSelectionConfig,
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    match strategy.mode.as_str() {
+        "pinned" => {
+            if let Some(target) = &strategy.pinned_label {
+                candidates.iter().position(|p| p.label.as_deref() == Some(target))
+            } else {
+                Some(0)
+            }
+        }
+        "priority" => {
+            candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX))
+                .map(|(idx, _)| idx)
+        }
+        _ => {
+            // Weighted selection (default)
+            if let Some(sess) = &selection.session {
+                // Deterministic sticky selection using session hash
+                pick_index(candidates.len(), Some(sess))
+            } else {
+                let total_weight: u32 = candidates.iter().map(|p| p.weight.unwrap_or(1).max(1)).sum();
+                let mut rng_val = rand::random::<u32>() % total_weight;
+                for (i, p) in candidates.iter().enumerate() {
+                    let w = p.weight.unwrap_or(1).max(1);
+                    if rng_val < w {
+                        return Some(i);
+                    }
+                    rng_val -= w;
+                }
+                Some(0)
+            }
+        }
+    }
+}
+
+#[allow(clippy::allow_attributes, unused_imports, dead_code)]
+pub use pick_candidate_index as pick_upstream_candidate;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ProxyConfig, RouterSelectionConfig};
+
+    #[test]
+    fn test_pick_upstream_priority_mode() {
+        let mut p1 = ProxyConfig::default_for_test();
+        p1.priority = Some(20);
+        p1.label = Some("low-priority".into());
+
+        let mut p2 = ProxyConfig::default_for_test();
+        p2.priority = Some(5);
+        p2.label = Some("high-priority".into());
+
+        let candidates = vec![p1, p2];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig {
+            mode: "priority".into(),
+            pinned_label: None,
+        };
+
+        let idx = pick_candidate_index(&candidates, &sel, &strategy);
+        assert_eq!(idx, Some(1)); // p2 has lower priority number (higher rank)
+    }
+
+    #[test]
+    fn test_pick_upstream_pinned_mode() {
+        let mut p1 = ProxyConfig::default_for_test();
+        p1.label = Some("gw-a".into());
+
+        let mut p2 = ProxyConfig::default_for_test();
+        p2.label = Some("gw-b".into());
+
+        let candidates = vec![p1, p2];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: Some("gw-b".into()),
+        };
+
+        let idx = pick_candidate_index(&candidates, &sel, &strategy);
+        assert_eq!(idx, Some(1));
+    }
+
+    #[test]
+    fn test_pick_upstream_pinned_missing_label() {
+        let p1 = ProxyConfig::default_for_test();
+        let candidates = vec![p1];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: Some("non-existent".into()),
+        };
+        assert_eq!(pick_candidate_index(&candidates, &sel, &strategy), None);
+
+        let strategy_none = RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: None,
+        };
+        assert_eq!(pick_candidate_index(&candidates, &sel, &strategy_none), Some(0));
+    }
+
+    #[test]
+    fn test_pick_upstream_weighted_mode() {
+        let mut p1 = ProxyConfig::default_for_test();
+        p1.weight = Some(10);
+        let mut p2 = ProxyConfig::default_for_test();
+        p2.weight = Some(20);
+
+        let candidates = vec![p1, p2];
+        let strategy = RouterSelectionConfig::default(); // mode: "weighted"
+
+        // Random pick without session should always return valid index
+        let sel_no_sess = Selection::default();
+        let idx = pick_candidate_index(&candidates, &sel_no_sess, &strategy);
+        assert!(idx == Some(0) || idx == Some(1));
+
+        // Deterministic sticky selection with session
+        let mut sel_sess = Selection::default();
+        sel_sess.session = Some("sticky-abc".into());
+        let idx_a = pick_candidate_index(&candidates, &sel_sess, &strategy);
+        let idx_b = pick_candidate_index(&candidates, &sel_sess, &strategy);
+        assert_eq!(idx_a, idx_b);
+        assert!(idx_a.is_some());
+    }
+
+    #[test]
+    fn test_pick_upstream_empty_candidates() {
+        let candidates: Vec<ProxyConfig> = vec![];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig::default();
+        assert_eq!(pick_candidate_index(&candidates, &sel, &strategy), None);
+    }
 
     fn tags(country: &str, isp: &str, kind: &str) -> Tags {
         Tags {

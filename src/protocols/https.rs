@@ -246,6 +246,8 @@ mod https_cov {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 

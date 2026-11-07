@@ -275,6 +275,8 @@ mod socks4_cov {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 
@@ -522,6 +524,8 @@ mod socks4_cov2 {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 

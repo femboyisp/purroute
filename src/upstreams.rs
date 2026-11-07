@@ -80,6 +80,8 @@ fn build_proxy(
         username_prefixes: None,
         password_prefixes: None,
         token_delimiter: None,
+        priority: None,
+        weight: None,
     }
 }
 

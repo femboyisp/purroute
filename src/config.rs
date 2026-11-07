@@ -88,6 +88,30 @@ pub struct RouterConfig {
     /// Upstream health tracking and failover retry settings.
     #[serde(default)]
     pub upstream_health: UpstreamHealthConfig,
+    /// Upstream selection strategy (`weighted`, `priority`, `pinned`).
+    #[serde(default)]
+    pub selection: Option<RouterSelectionConfig>,
+}
+
+/// Upstream candidate selection strategy configuration.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RouterSelectionConfig {
+    #[serde(default = "default_selection_mode")]
+    pub mode: String,
+    pub pinned_label: Option<String>,
+}
+
+fn default_selection_mode() -> String {
+    "weighted".into()
+}
+
+impl Default for RouterSelectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_selection_mode(),
+            pinned_label: None,
+        }
+    }
 }
 
 /// Upstream port health tracking, retries, and failover configuration.
@@ -177,6 +201,7 @@ impl Default for RouterConfig {
             tor: HiddenHopConfig::default(),
             i2p: HiddenHopConfig::default(),
             upstream_health: UpstreamHealthConfig::default(),
+            selection: None,
         }
     }
 }
@@ -253,6 +278,12 @@ pub struct ProxyConfig {
     /// Optional delimiter for token formatting (e.g. "_" or "-").
     #[serde(default)]
     pub token_delimiter: Option<String>,
+    /// Upstream selection priority (lower number = higher rank).
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// Upstream selection weight (higher number = more traffic).
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Parsed proxy endpoint: host, optional single port, optional inclusive port range.
@@ -315,6 +346,26 @@ impl ProxyConfig {
     /// `.onion` / `.i2p` hosts when no port is configured.
     pub fn get_upstream_addr(&self) -> String {
         crate::hidden::socket_addr(&self.address, self.port)
+    }
+
+    #[allow(clippy::allow_attributes, dead_code)]
+    pub fn default_for_test() -> Self {
+        Self {
+            label: None,
+            proxy_type: Protocol::Http,
+            address: "127.0.0.1".into(),
+            port: Some(1080),
+            port_range: None,
+            username: None,
+            password: None,
+            tags: Tags::default(),
+            cost_per_byte: default_cost_per_byte(),
+            username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: None,
+            weight: None,
+        }
     }
 }
 
@@ -534,8 +585,37 @@ address = "proxy.example.com:11000-11010"
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         };
         assert_eq!(p.get_upstream_addr(), "proxy.example.com");
+    }
+
+    #[test]
+    fn router_selection_config_parsing() {
+        let toml_str = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [router.selection]
+            mode = "priority"
+            pinned_label = "gw-1"
+
+            [[proxy]]
+            proxy_type = "Http"
+            address = "127.0.0.1:8080"
+            priority = 10
+            weight = 5
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.router.selection,
+            Some(RouterSelectionConfig {
+                mode: "priority".into(),
+                pinned_label: Some("gw-1".into()),
+            })
+        );
+        assert_eq!(cfg.proxy[0].priority, Some(10));
+        assert_eq!(cfg.proxy[0].weight, Some(5));
     }
 
     /// `Config::load` reads a TOML file from disk.

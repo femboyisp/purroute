@@ -160,7 +160,7 @@ impl ProxyServer {
         selection: &crate::routing::Selection,
         excluded_ports: &[u16],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        let mut chain = self.resolve_chain_inner(selection)?;
+        let mut chain = self.resolve_chain_inner_excluded(selection, excluded_ports)?;
         for p in &mut chain {
             if let Some(range) = p.port_range {
                 p.port = Some(crate::routing::pick_port_healthy(
@@ -193,9 +193,18 @@ impl ProxyServer {
     /// are templated (`username_prefixes`) match any value for that
     /// dimension; [`resolve_proxy_chain`] fills in the per-connection
     /// username afterwards.
+    #[allow(clippy::allow_attributes, dead_code)]
     fn resolve_chain_inner(
         &self,
         selection: &crate::routing::Selection,
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
+        self.resolve_chain_inner_excluded(selection, &[])
+    }
+
+    fn resolve_chain_inner_excluded(
+        &self,
+        selection: &crate::routing::Selection,
+        excluded_ports: &[u16],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
         // An explicit `chain` selection names a `[[proxy]]` label or `[[chain]]`
         // id directly and takes precedence over the tag dimensions.
@@ -216,7 +225,8 @@ impl ProxyServer {
         if !selection.only_session() {
             // Filter upstreams by the selection's tags, then pick (sticky/rotate).
             let proxies = self.proxy.load();
-            let candidates: Vec<ProxyConfig> = proxies
+            let strategy = self.config.selection.as_ref().cloned().unwrap_or_default();
+            let mut candidates: Vec<ProxyConfig> = proxies
                 .iter()
                 .filter(|p| {
                     selection.matches_upstream_all(
@@ -227,23 +237,99 @@ impl ProxyServer {
                 })
                 .cloned()
                 .collect();
-            let idx = crate::routing::pick_index(candidates.len(), selection.session.as_deref())
+
+            if candidates.is_empty() {
+                return Err(ProxyError::NoMatchingUpstream);
+            }
+
+            match strategy.mode.as_str() {
+                "priority" => candidates.sort_by_key(|p| p.priority.unwrap_or(u32::MAX)),
+                "weighted" => candidates.sort_by_key(|p| std::cmp::Reverse(p.weight.unwrap_or(1))),
+                _ => {}
+            }
+
+            let filtered_candidates: Vec<ProxyConfig> = candidates
+                .iter()
+                .filter(|p| {
+                    if let Some(port) = p.port {
+                        if p.port_range.is_none() && excluded_ports.contains(&port) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+
+            let active_candidates = if filtered_candidates.is_empty() {
+                &candidates
+            } else {
+                &filtered_candidates
+            };
+
+            let idx = crate::routing::pick_candidate_index(active_candidates, selection, &strategy)
                 .ok_or(ProxyError::NoMatchingUpstream)?;
-            return Ok(vec![candidates[idx].clone()]);
+            return Ok(vec![active_candidates[idx].clone()]);
         }
-        self.resolve_global_chain()
+        self.resolve_global_chain_excluded(excluded_ports)
     }
 
     /// The original global resolution: a single `[[proxy]]` by label or a
     /// `[[chain]]` by id, used when no location/ISP selection is given.
+    #[allow(clippy::allow_attributes, dead_code)]
     fn resolve_global_chain(&self) -> Result<Vec<ProxyConfig>, ProxyError> {
+        self.resolve_global_chain_excluded(&[])
+    }
+
+    fn resolve_global_chain_excluded(
+        &self,
+        excluded_ports: &[u16],
+    ) -> Result<Vec<ProxyConfig>, ProxyError> {
         // If router.chain names a proxy/chain, resolve it; else fall back to the
         // first configured proxy (backward compatibility).
         if let Some(chain_ref) = &self.config.chain {
             return self.resolve_ref(chain_ref);
         }
         let proxies = self.proxy.load();
-        let proxy = proxies
+        if proxies.is_empty() {
+            return Err(ProxyError::Protocol("No proxy configuration available".to_string()));
+        }
+
+        let filtered: Vec<ProxyConfig> = proxies
+            .iter()
+            .filter(|p| {
+                if let Some(port) = p.port {
+                    if p.port_range.is_none() && excluded_ports.contains(&port) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        let candidates = if filtered.is_empty() {
+            proxies.to_vec()
+        } else {
+            filtered
+        };
+
+        if let Some(strategy) = &self.config.selection {
+            let mut ordered_candidates = candidates;
+            match strategy.mode.as_str() {
+                "priority" => ordered_candidates.sort_by_key(|p| p.priority.unwrap_or(u32::MAX)),
+                "weighted" => ordered_candidates.sort_by_key(|p| std::cmp::Reverse(p.weight.unwrap_or(1))),
+                _ => {}
+            }
+            let idx = crate::routing::pick_candidate_index(
+                &ordered_candidates,
+                &crate::routing::Selection::default(),
+                strategy,
+            )
+            .unwrap_or(0);
+            return Ok(vec![ordered_candidates[idx].clone()]);
+        }
+
+        let proxy = candidates
             .first()
             .ok_or_else(|| ProxyError::Protocol("No proxy configuration available".to_string()))?
             .clone();
@@ -1732,6 +1818,8 @@ mod loopback {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 
@@ -2481,6 +2569,8 @@ mod proxy_cov2 {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 
@@ -2744,6 +2834,8 @@ mod proxy_cov2 {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }];
         let srv = mk(proxies, None, None, vec![user], true);
         let router = serve1(srv).await;
@@ -2779,6 +2871,8 @@ mod proxy_cov2 {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         }];
         // auth disabled so SOCKS5 uses no-auth, but still hits IP default selection.
         let srv = mk(proxies, None, None, vec![user], false);
@@ -2853,6 +2947,8 @@ mod proxy_cov2 {
                 username_prefixes: None,
                 password_prefixes: None,
                 token_delimiter: None,
+                priority: None,
+                weight: None,
             },
             px("ww", Proxy::Socks5, ww),
         ];
@@ -3260,6 +3356,8 @@ mod proxy_cov2 {
             username_prefixes: None,
             password_prefixes: None,
             token_delimiter: None,
+            priority: None,
+            weight: None,
         };
         crate::config::normalize_proxy_endpoints(std::slice::from_mut(&mut proxy)).unwrap();
 
@@ -3315,5 +3413,161 @@ mod proxy_cov2 {
             chain[0].password.as_deref(),
             Some("secret_country-US_session-sess456")
         );
+    }
+
+    #[test]
+    fn test_resolve_chain_selection_priority_and_failover() {
+        use crate::config::RouterSelectionConfig;
+
+        let mut p1 = px("gw-a", Proxy::Socks5, "127.0.0.1:1080".parse().unwrap());
+        p1.priority = Some(20);
+        let mut p2 = px("gw-b", Proxy::Socks5, "127.0.0.1:1081".parse().unwrap());
+        p2.priority = Some(5);
+
+        let mut router_cfg = RouterConfig::default();
+        router_cfg.selection = Some(RouterSelectionConfig {
+            mode: "priority".into(),
+            pinned_label: None,
+        });
+
+        let srv = Arc::new(ProxyServer::new(
+            vec![p1, p2],
+            None,
+            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(router_cfg),
+            Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
+        ));
+
+        let sel = crate::routing::Selection::default();
+
+        // Without excluded ports, picks priority 5 (p2, port 1081)
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[]).unwrap();
+        assert_eq!(chain[0].port, Some(1081));
+
+        // When port 1081 fails, excludes it and fails over to p1 (port 1080)
+        let chain_retry = srv.resolve_proxy_chain_excluded(&sel, &[1081]).unwrap();
+        assert_eq!(chain_retry[0].port, Some(1080));
+    }
+
+    #[test]
+    fn test_resolve_chain_selection_pinned() {
+        use crate::config::RouterSelectionConfig;
+
+        let p1 = px("gw-a", Proxy::Socks5, "127.0.0.1:1080".parse().unwrap());
+        let p2 = px("gw-b", Proxy::Socks5, "127.0.0.1:1081".parse().unwrap());
+
+        let mut router_cfg = RouterConfig::default();
+        router_cfg.selection = Some(RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: Some("gw-b".into()),
+        });
+
+        let srv = Arc::new(ProxyServer::new(
+            vec![p1, p2],
+            None,
+            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(router_cfg),
+            Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
+        ));
+
+        let sel = crate::routing::Selection::default();
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[]).unwrap();
+        assert_eq!(chain[0].label.as_deref(), Some("gw-b"));
+    }
+
+    #[tokio::test]
+    async fn test_transparent_candidate_priority_failover_e2e() {
+        use crate::config::{ProxyConfig, RouterSelectionConfig, Tags};
+
+        let l2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p2_addr = l2_listener.local_addr().unwrap();
+
+        // Upstream 2 responds OK
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l2_listener.accept().await {
+                s5_greeting(&mut s).await;
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let _ = s5_connect(&mut s).await;
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY2.len(),
+                    BODY2
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+            }
+        });
+
+        // Upstream 1 is at a closed/dead port with higher priority (10)
+        let p1 = ProxyConfig {
+            label: Some("primary-upstream".into()),
+            proxy_type: Proxy::Socks5,
+            address: "127.0.0.1".into(),
+            port: Some(1), // closed port -> connection refused
+            port_range: None,
+            username: None,
+            password: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: Some(10), // higher priority
+            weight: None,
+        };
+
+        // Upstream 2 is healthy with lower priority (20)
+        let p2 = ProxyConfig {
+            label: Some("secondary-upstream".into()),
+            proxy_type: Proxy::Socks5,
+            address: p2_addr.ip().to_string(),
+            port: Some(p2_addr.port()),
+            port_range: None,
+            username: None,
+            password: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: Some(20), // lower priority
+            weight: None,
+        };
+
+        let mut router_cfg = RouterConfig::default();
+        router_cfg.upstream_health.handshake_timeout_secs = 1;
+        router_cfg.upstream_health.max_retries = 2;
+        router_cfg.selection = Some(RouterSelectionConfig {
+            mode: "priority".into(),
+            pinned_label: None,
+        });
+
+        let srv = Arc::new(ProxyServer::new(
+            vec![p1, p2],
+            None,
+            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(router_cfg),
+            Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
+        ));
+
+        let front = serve1((*srv).clone()).await;
+        let mut client = TcpStream::connect(front).await.unwrap();
+
+        // Send SOCKS5 greeting
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut sel = [0u8; 2];
+        client.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x00]);
+
+        // SOCKS5 connect to 127.0.0.1:80
+        client.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80]).await.unwrap();
+        let mut rep = [0u8; 10];
+        client.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00, "Connection should succeed via failover to secondary candidate");
     }
 }
