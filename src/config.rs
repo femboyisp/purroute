@@ -245,6 +245,14 @@ pub struct ProxyConfig {
     /// the static `username` is used unchanged.
     #[serde(default)]
     pub username_prefixes: Option<std::collections::BTreeMap<String, String>>,
+    /// Optional per-connection password builder: routing dimension -> token
+    /// prefix. When present, the outgoing password has selected values appended
+    /// or injected.
+    #[serde(default)]
+    pub password_prefixes: Option<std::collections::BTreeMap<String, String>>,
+    /// Optional delimiter for token formatting (e.g. "_" or "-").
+    #[serde(default)]
+    pub token_delimiter: Option<String>,
 }
 
 /// Parsed proxy endpoint: host, optional single port, optional inclusive port range.
@@ -524,6 +532,8 @@ address = "proxy.example.com:11000-11010"
             },
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
         };
         assert_eq!(p.get_upstream_addr(), "proxy.example.com");
     }
@@ -593,6 +603,56 @@ port = 1080
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.proxy[0].username_prefixes.is_none());
+    }
+
+    #[test]
+    fn proxy_password_prefixes_and_delimiter_parses() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "gw"
+            proxy_type = "Socks5"
+            address = "gw.example.com"
+            port = 9000
+            password = "base"
+            token_delimiter = "_"
+            password_prefixes = { country = "-country-", session = "-session-" }
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let p = &cfg.proxy[0];
+        assert_eq!(p.token_delimiter.as_deref(), Some("_"));
+        assert_eq!(
+            p.password_prefixes
+                .as_ref()
+                .unwrap()
+                .get("country")
+                .unwrap(),
+            "-country-"
+        );
+        assert_eq!(
+            p.password_prefixes
+                .as_ref()
+                .unwrap()
+                .get("session")
+                .unwrap(),
+            "-session-"
+        );
+    }
+
+    #[test]
+    fn proxy_password_prefixes_and_delimiter_defaults_none() {
+        let toml = r#"
+            [router]
+            listen = "127.0.0.1:1080"
+            [[proxy]]
+            label = "a"
+            proxy_type = "Socks5"
+            address = "127.0.0.1:9000"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.proxy[0].password_prefixes.is_none());
+        assert!(cfg.proxy[0].token_delimiter.is_none());
     }
 
     #[test]

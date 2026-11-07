@@ -175,6 +175,15 @@ impl ProxyServer {
                 let base = p.username.clone().unwrap_or_default();
                 p.username = Some(crate::routing::build_username(&base, prefixes, selection));
             }
+            if let Some(prefixes) = &p.password_prefixes {
+                let base = p.password.clone().unwrap_or_default();
+                p.password = Some(crate::routing::build_password(
+                    &base,
+                    prefixes,
+                    p.token_delimiter.as_deref(),
+                    selection,
+                ));
+            }
         }
         Ok(chain)
     }
@@ -209,7 +218,13 @@ impl ProxyServer {
             let proxies = self.proxy.load();
             let candidates: Vec<ProxyConfig> = proxies
                 .iter()
-                .filter(|p| selection.matches_upstream(&p.tags, p.username_prefixes.as_ref()))
+                .filter(|p| {
+                    selection.matches_upstream_all(
+                        &p.tags,
+                        p.username_prefixes.as_ref(),
+                        p.password_prefixes.as_ref(),
+                    )
+                })
                 .cloned()
                 .collect();
             let idx = crate::routing::pick_index(candidates.len(), selection.session.as_deref())
@@ -1715,6 +1730,8 @@ mod loopback {
             tags,
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
         }
     }
 
@@ -2462,6 +2479,8 @@ mod proxy_cov2 {
             tags: Tags::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
         }
     }
 
@@ -2723,6 +2742,8 @@ mod proxy_cov2 {
             },
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
         }];
         let srv = mk(proxies, None, None, vec![user], true);
         let router = serve1(srv).await;
@@ -2756,6 +2777,8 @@ mod proxy_cov2 {
             },
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
         }];
         // auth disabled so SOCKS5 uses no-auth, but still hits IP default selection.
         let srv = mk(proxies, None, None, vec![user], false);
@@ -2828,6 +2851,8 @@ mod proxy_cov2 {
                 },
                 cost_per_byte: 1.0,
                 username_prefixes: None,
+                password_prefixes: None,
+                token_delimiter: None,
             },
             px("ww", Proxy::Socks5, ww),
         ];
@@ -3233,6 +3258,8 @@ mod proxy_cov2 {
             tags: Tags::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
         };
         crate::config::normalize_proxy_endpoints(std::slice::from_mut(&mut proxy)).unwrap();
 
@@ -3266,5 +3293,27 @@ mod proxy_cov2 {
         let mut rep = [0u8; 10];
         client.read_exact(&mut rep).await.unwrap();
         assert_eq!(rep[1], 0x00, "Connection should succeed via retry");
+    }
+
+    #[test]
+    fn test_resolve_proxy_chain_formats_password() {
+        let mut p = px("test", Proxy::Socks5, "127.0.0.1:1080".parse().unwrap());
+        p.password = Some("secret".into());
+        p.token_delimiter = Some("_".into());
+        let mut prefixes = std::collections::BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+        prefixes.insert("session".into(), "-session-".into());
+        p.password_prefixes = Some(prefixes);
+
+        let srv = mk(vec![p], None, Some("test"), vec![], false);
+        let mut sel = crate::routing::Selection::default();
+        sel.country = vec!["us".into()];
+        sel.session = Some("sess456".into());
+
+        let chain = srv.resolve_proxy_chain_excluded(&sel, &[]).unwrap();
+        assert_eq!(
+            chain[0].password.as_deref(),
+            Some("secret_country-US_session-sess456")
+        );
     }
 }

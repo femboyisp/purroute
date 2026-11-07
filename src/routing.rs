@@ -91,14 +91,29 @@ impl Selection {
     }
 
     /// Like [`matches`](Self::matches) but an upstream that *templates* a
-    /// dimension (has a `username_prefixes` entry for it) serves any value for
-    /// that dimension, so the tag check is skipped for it.
+    /// dimension (has a `username_prefixes` or `password_prefixes` entry for it)
+    /// serves any value for that dimension, so the tag check is skipped for it.
+    #[allow(dead_code, clippy::allow_attributes)]
     pub fn matches_upstream(
         &self,
         tags: &Tags,
         prefixes: Option<&BTreeMap<String, String>>,
     ) -> bool {
-        let templated = |dim: &str| prefixes.is_some_and(|p| p.contains_key(dim));
+        self.matches_upstream_all(tags, prefixes, None)
+    }
+
+    /// Check whether an upstream satisfies the selection, treating dimensions
+    /// configured in either `username_prefixes` or `password_prefixes` as templated.
+    pub fn matches_upstream_all(
+        &self,
+        tags: &Tags,
+        username_prefixes: Option<&BTreeMap<String, String>>,
+        password_prefixes: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        let templated = |dim: &str| {
+            username_prefixes.is_some_and(|p| p.contains_key(dim))
+                || password_prefixes.is_some_and(|p| p.contains_key(dim))
+        };
         (templated("country") || dim_ok(&self.country, &tags.country))
             && (templated("state") || dim_ok(&self.state, &tags.state))
             && (templated("city") || dim_ok(&self.city, &tags.city))
@@ -390,6 +405,39 @@ pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Sel
     }
 
     out
+}
+
+/// Format an upstream password string by injecting routing selection dimensions.
+pub fn build_password(
+    base: &str,
+    prefixes: &BTreeMap<String, String>,
+    delimiter: Option<&str>,
+    selection: &Selection,
+) -> String {
+    let delim = delimiter.unwrap_or("_");
+    let mut tokens = Vec::new();
+
+    if let (Some(prefix), Some(c)) = (prefixes.get("country"), selection.country.first()) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), c.to_ascii_uppercase()));
+    }
+    if let (Some(prefix), Some(s)) = (prefixes.get("state"), selection.state.first()) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), s.to_ascii_uppercase()));
+    }
+    if let (Some(prefix), Some(c)) = (prefixes.get("city"), selection.city.first()) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), c));
+    }
+    if let (Some(prefix), Some(i)) = (prefixes.get("isp"), selection.isp.first()) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), i));
+    }
+    if let (Some(prefix), Some(s)) = (prefixes.get("session"), &selection.session) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), s));
+    }
+
+    if tokens.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{}{}{}", base, delim, tokens.join(delim))
+    }
 }
 
 /// Pick one port from an inclusive range: sticky by `session`, else random.
@@ -723,6 +771,54 @@ mod tests {
         // Exactly one of the three countries is chosen, deterministically.
         assert_eq!(u, build_username("BASE", &prefixes, &sel));
         assert!(["BASE-country-us", "BASE-country-de", "BASE-country-fr"].contains(&u.as_str()));
+    }
+
+    #[test]
+    fn test_build_password_with_underscore_delimiter() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+        prefixes.insert("session".into(), "-session-".into());
+
+        let mut selection = Selection::default();
+        selection.country = vec!["us".into()];
+        selection.session = Some("sess123".into());
+
+        let result = build_password("mypassword", &prefixes, Some("_"), &selection);
+        assert_eq!(result, "mypassword_country-US_session-sess123");
+    }
+
+    #[test]
+    fn test_build_password_empty_selection_keeps_base() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+
+        let selection = Selection::default();
+        let result = build_password("mypassword", &prefixes, Some("_"), &selection);
+        assert_eq!(result, "mypassword");
+    }
+
+    #[test]
+    fn test_build_password_all_dimensions_and_default_delimiter() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+        prefixes.insert("state".into(), "-state-".into());
+        prefixes.insert("city".into(), "-city-".into());
+        prefixes.insert("isp".into(), "-isp-".into());
+        prefixes.insert("session".into(), "session-".into());
+
+        let mut selection = Selection::default();
+        selection.country = vec!["us".into()];
+        selection.state = vec!["ca".into()];
+        selection.city = vec!["losangeles".into()];
+        selection.isp = vec!["comcast".into()];
+        selection.session = Some("sess999".into());
+
+        // Default delimiter is "_" when None
+        let result = build_password("basepass", &prefixes, None, &selection);
+        assert_eq!(
+            result,
+            "basepass_country-US_state-CA_city-losangeles_isp-comcast_session-sess999"
+        );
     }
 
     #[test]
