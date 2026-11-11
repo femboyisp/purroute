@@ -1178,4 +1178,35 @@ mod tests {
         let result = build_password("basepass", &prefixes, Some("_"), &selection);
         assert_eq!(result, "basepass_type-residential_life-30_strict-1");
     }
+
+    #[test]
+    fn build_password_formats_evomi_full_targeting_suite() {
+        let mut prefixes = std::collections::BTreeMap::new();
+        prefixes.insert("country".into(), "country-".into());
+        prefixes.insert("state".into(), "region-".into());
+        prefixes.insert("city".into(), "city-".into());
+        prefixes.insert("isp".into(), "isp-".into());
+        prefixes.insert("session".into(), "session-".into());
+        prefixes.insert("lifetime".into(), "lifetime-".into());
+
+        let selection = Selection {
+            country: vec!["us".into()],
+            state: vec!["ca".into()],
+            city: vec!["losangeles".into()],
+            isp: vec!["7922".into()],
+            kind: vec![],
+            asn: None,
+            session: Some("work1".into()),
+            lifetime: Some("30".into()),
+            strict: None,
+            chain: None,
+            postal: vec![],
+        };
+
+        let pw = build_password("basepass", &prefixes, Some("_"), &selection);
+        assert_eq!(
+            pw,
+            "basepass_country-US_region-CA_city-losangeles_isp-7922_session-work1_lifetime-30"
+        );
+    }
 }
