@@ -418,10 +418,18 @@ pub fn build_password(
     let mut tokens = Vec::new();
 
     if let (Some(prefix), Some(c)) = (prefixes.get("country"), selection.country.first()) {
-        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), c.to_ascii_uppercase()));
+        tokens.push(format!(
+            "{}{}",
+            prefix.trim_start_matches('-'),
+            c.to_ascii_uppercase()
+        ));
     }
     if let (Some(prefix), Some(s)) = (prefixes.get("state"), selection.state.first()) {
-        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), s.to_ascii_uppercase()));
+        tokens.push(format!(
+            "{}{}",
+            prefix.trim_start_matches('-'),
+            s.to_ascii_uppercase()
+        ));
     }
     if let (Some(prefix), Some(c)) = (prefixes.get("city"), selection.city.first()) {
         tokens.push(format!("{}{}", prefix.trim_start_matches('-'), c));
@@ -436,7 +444,11 @@ pub fn build_password(
         tokens.push(format!("{}{}", prefix.trim_start_matches('-'), k));
     }
     if let (Some(prefix), Some(s)) = (prefixes.get("session"), &selection.session) {
-        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), clamp_session_id(s)));
+        tokens.push(format!(
+            "{}{}",
+            prefix.trim_start_matches('-'),
+            clamp_session_id(s)
+        ));
     }
     if let (Some(prefix), Some(l)) = (prefixes.get("lifetime"), &selection.lifetime) {
         tokens.push(format!("{}{}", prefix.trim_start_matches('-'), l));
@@ -453,7 +465,7 @@ pub fn build_password(
 }
 
 /// Pick one port from an inclusive range: sticky by `session`, else random.
-#[expect(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn pick_port(range: (u16, u16), session: Option<&str>) -> u16 {
     let len = u32::from(range.1.saturating_sub(range.0)) + 1;
     let idx = pick_index(len as usize, session).unwrap_or(0);
@@ -542,21 +554,24 @@ pub fn pick_candidate_index(
     match strategy.mode.as_str() {
         "pinned" => {
             if let Some(target) = &strategy.pinned_label {
-                candidates.iter().position(|p| p.label.as_deref() == Some(target))
+                candidates
+                    .iter()
+                    .position(|p| p.label.as_deref() == Some(target))
             } else {
                 Some(0)
             }
         }
-        "priority" => {
-            candidates
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX))
-                .map(|(idx, _)| idx)
-        }
+        "priority" => candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX))
+            .map(|(idx, _)| idx),
         _ => {
             // Weighted selection (default)
-            let total_weight: u32 = candidates.iter().map(|p| p.weight.unwrap_or(1).max(1)).sum();
+            let total_weight: u32 = candidates
+                .iter()
+                .map(|p| p.weight.unwrap_or(1).max(1))
+                .sum();
             if let Some(sess) = &selection.session {
                 // Deterministic sticky weighted selection using session hash
                 let mut hash_val = (fnv1a(sess) % (total_weight as u64)) as u32;
@@ -646,7 +661,10 @@ mod tests {
             mode: "pinned".into(),
             pinned_label: None,
         };
-        assert_eq!(pick_candidate_index(&candidates, &sel, &strategy_none), Some(0));
+        assert_eq!(
+            pick_candidate_index(&candidates, &sel, &strategy_none),
+            Some(0)
+        );
     }
 
     #[test]
@@ -665,8 +683,10 @@ mod tests {
         assert!(idx == Some(0) || idx == Some(1));
 
         // Deterministic sticky selection with session
-        let mut sel_sess = Selection::default();
-        sel_sess.session = Some("sticky-abc".into());
+        let sel_sess = Selection {
+            session: Some("sticky-abc".into()),
+            ..Default::default()
+        };
         let idx_a = pick_candidate_index(&candidates, &sel_sess, &strategy);
         let idx_b = pick_candidate_index(&candidates, &sel_sess, &strategy);
         assert_eq!(idx_a, idx_b);
@@ -857,8 +877,10 @@ mod tests {
         // Mark that chosen port dead:
         tracker.record_failure("proxy.socks.cat", normal);
 
-        let fallback_1 = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
-        let fallback_2 = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+        let fallback_1 =
+            pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+        let fallback_2 =
+            pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
 
         assert_ne!(normal, fallback_1);
         assert_eq!(fallback_1, fallback_2); // Consistent fallback across requests!
@@ -939,9 +961,11 @@ mod tests {
         prefixes.insert("country".into(), "-country-".into());
         prefixes.insert("session".into(), "-session-".into());
 
-        let mut selection = Selection::default();
-        selection.country = vec!["us".into()];
-        selection.session = Some("sess123".into());
+        let selection = Selection {
+            country: vec!["us".into()],
+            session: Some("sess123".into()),
+            ..Default::default()
+        };
 
         let result = build_password("mypassword", &prefixes, Some("_"), &selection);
         assert_eq!(result, "mypassword_country-US_session-sess123");
@@ -966,12 +990,14 @@ mod tests {
         prefixes.insert("isp".into(), "-isp-".into());
         prefixes.insert("session".into(), "session-".into());
 
-        let mut selection = Selection::default();
-        selection.country = vec!["us".into()];
-        selection.state = vec!["ca".into()];
-        selection.city = vec!["losangeles".into()];
-        selection.isp = vec!["comcast".into()];
-        selection.session = Some("sess999".into());
+        let selection = Selection {
+            country: vec!["us".into()],
+            state: vec!["ca".into()],
+            city: vec!["losangeles".into()],
+            isp: vec!["comcast".into()],
+            session: Some("sess999".into()),
+            ..Default::default()
+        };
 
         // Default delimiter is "_" when None
         let result = build_password("basepass", &prefixes, None, &selection);
@@ -1121,8 +1147,10 @@ mod tests {
 
         for i in 0..total {
             let sess = format!("session_key_{i}");
-            let mut sel = Selection::default();
-            sel.session = Some(sess.clone());
+            let sel = Selection {
+                session: Some(sess.clone()),
+                ..Default::default()
+            };
 
             let idx1 = pick_candidate_index(&candidates, &sel, &strategy).unwrap();
             let idx2 = pick_candidate_index(&candidates, &sel, &strategy).unwrap();
@@ -1152,8 +1180,10 @@ mod tests {
         let mut prefixes = BTreeMap::new();
         prefixes.insert("session".into(), "-session-".into());
 
-        let mut selection = Selection::default();
-        selection.session = Some("evil;pass_delims!@#".into());
+        let selection = Selection {
+            session: Some("evil;pass_delims!@#".into()),
+            ..Default::default()
+        };
 
         let result = build_password("basepass", &prefixes, Some("_"), &selection);
         // clamp_session_id should hash any string containing non-[A-Za-z0-9_] characters
@@ -1170,10 +1200,12 @@ mod tests {
         prefixes.insert("lifetime".into(), "-life-".into());
         prefixes.insert("strict".into(), "-strict-".into());
 
-        let mut selection = Selection::default();
-        selection.kind = vec!["residential".into()];
-        selection.lifetime = Some("30".into());
-        selection.strict = Some("1".into());
+        let selection = Selection {
+            kind: vec!["residential".into()],
+            lifetime: Some("30".into()),
+            strict: Some("1".into()),
+            ..Default::default()
+        };
 
         let result = build_password("basepass", &prefixes, Some("_"), &selection);
         assert_eq!(result, "basepass_type-residential_life-30_strict-1");

@@ -1,4 +1,5 @@
 //! Purroute — an auto-detecting proxy router.
+#![allow(clippy::double_must_use)]
 //!
 //! Listens on a local address, detects the inbound proxy protocol (SOCKS5,
 //! SOCKS4/4a, HTTP, HTTPS-CONNECT) from the first bytes of each connection, and

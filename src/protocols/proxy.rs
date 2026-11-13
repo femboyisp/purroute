@@ -99,7 +99,8 @@ impl ProxyServer {
         excluded_ports: &[u16],
         excluded_endpoints: &[(String, u16)],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        let chain = self.resolve_proxy_chain_excluded(selection, excluded_ports, excluded_endpoints)?;
+        let chain =
+            self.resolve_proxy_chain_excluded(selection, excluded_ports, excluded_endpoints)?;
         self.prepend_hidden_hops(chain, target_host)
     }
 
@@ -148,7 +149,7 @@ impl ProxyServer {
     /// Resolve the upstream chain for a connection, honouring a routing
     /// [`Selection`] when it constrains location/ISP/type; otherwise the global
     /// `[router].chain`.
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     fn resolve_proxy_chain(
         &self,
         selection: &crate::routing::Selection,
@@ -162,7 +163,8 @@ impl ProxyServer {
         excluded_ports: &[u16],
         excluded_endpoints: &[(String, u16)],
     ) -> Result<Vec<ProxyConfig>, ProxyError> {
-        let mut chain = self.resolve_chain_inner_excluded(selection, excluded_ports, excluded_endpoints)?;
+        let mut chain =
+            self.resolve_chain_inner_excluded(selection, excluded_ports, excluded_endpoints)?;
         for p in &mut chain {
             if let Some(range) = p.port_range {
                 p.port = Some(crate::routing::pick_port_healthy(
@@ -256,7 +258,10 @@ impl ProxyServer {
                 .filter(|p| {
                     if let Some(port) = p.port {
                         if p.port_range.is_none() {
-                            if excluded_endpoints.iter().any(|(addr, pt)| addr == &p.address && *pt == port) {
+                            if excluded_endpoints
+                                .iter()
+                                .any(|(addr, pt)| addr == &p.address && *pt == port)
+                            {
                                 return false;
                             }
                             if excluded_endpoints.is_empty() && excluded_ports.contains(&port) {
@@ -301,7 +306,9 @@ impl ProxyServer {
         }
         let proxies = self.proxy.load();
         if proxies.is_empty() {
-            return Err(ProxyError::Protocol("No proxy configuration available".to_string()));
+            return Err(ProxyError::Protocol(
+                "No proxy configuration available".to_string(),
+            ));
         }
 
         let filtered: Vec<ProxyConfig> = proxies
@@ -309,7 +316,10 @@ impl ProxyServer {
             .filter(|p| {
                 if let Some(port) = p.port {
                     if p.port_range.is_none() {
-                        if excluded_endpoints.iter().any(|(addr, pt)| addr == &p.address && *pt == port) {
+                        if excluded_endpoints
+                            .iter()
+                            .any(|(addr, pt)| addr == &p.address && *pt == port)
+                        {
                             return false;
                         }
                         if excluded_endpoints.is_empty() && excluded_ports.contains(&port) {
@@ -331,7 +341,9 @@ impl ProxyServer {
             let mut ordered_candidates = candidates;
             match strategy.mode.as_str() {
                 "priority" => ordered_candidates.sort_by_key(|p| p.priority.unwrap_or(u32::MAX)),
-                "weighted" => ordered_candidates.sort_by_key(|p| std::cmp::Reverse(p.weight.unwrap_or(1))),
+                "weighted" => {
+                    ordered_candidates.sort_by_key(|p| std::cmp::Reverse(p.weight.unwrap_or(1)))
+                }
                 _ => {}
             }
             let idx = crate::routing::pick_candidate_index(
@@ -655,7 +667,14 @@ impl ProxyServer {
                 }
             };
 
-            match ChainConnector::connect_chain_with_health(&proxy_chain, &target_host, target_port, Some(&self.health)).await {
+            match ChainConnector::connect_chain_with_health(
+                &proxy_chain,
+                &target_host,
+                target_port,
+                Some(&self.health),
+            )
+            .await
+            {
                 Ok(u) => {
                     if attempt > 0 {
                         metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -738,7 +757,9 @@ impl ProxyServer {
             let chain_candidate = if attempt == 0 {
                 proxy_chain.clone()
             } else {
-                let selection = self.selection_for(&Proxy::Socks4, &initial_request, peer_addr).await;
+                let selection = self
+                    .selection_for(&Proxy::Socks4, &initial_request, peer_addr)
+                    .await;
                 self.resolve_proxy_chain_for_target_excluded(
                     &selection,
                     &target_host,
@@ -747,7 +768,14 @@ impl ProxyServer {
                 )?
             };
 
-            match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
+            match ChainConnector::connect_chain_with_health(
+                &chain_candidate,
+                &target_host,
+                target_port,
+                Some(&self.health),
+            )
+            .await
+            {
                 Ok(u) => {
                     if attempt > 0 {
                         metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -827,7 +855,9 @@ impl ProxyServer {
             let chain_candidate = if attempt == 0 {
                 proxy_chain.clone()
             } else {
-                let selection = self.selection_for(&Proxy::Https, &initial_request, peer_addr).await;
+                let selection = self
+                    .selection_for(&Proxy::Https, &initial_request, peer_addr)
+                    .await;
                 self.resolve_proxy_chain_for_target_excluded(
                     &selection,
                     &target_host,
@@ -836,7 +866,14 @@ impl ProxyServer {
                 )?
             };
 
-            match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
+            match ChainConnector::connect_chain_with_health(
+                &chain_candidate,
+                &target_host,
+                target_port,
+                Some(&self.health),
+            )
+            .await
+            {
                 Ok(u) => {
                     if attempt > 0 {
                         metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -916,7 +953,9 @@ impl ProxyServer {
             let chain_candidate = if attempt == 0 {
                 proxy_chain.clone()
             } else {
-                let selection = self.selection_for(&Proxy::Http, &initial_request, peer_addr).await;
+                let selection = self
+                    .selection_for(&Proxy::Http, &initial_request, peer_addr)
+                    .await;
                 self.resolve_proxy_chain_for_target_excluded(
                     &selection,
                     &target_host,
@@ -925,7 +964,14 @@ impl ProxyServer {
                 )?
             };
 
-            match ChainConnector::connect_chain_with_health(&chain_candidate, &target_host, target_port, Some(&self.health)).await {
+            match ChainConnector::connect_chain_with_health(
+                &chain_candidate,
+                &target_host,
+                target_port,
+                Some(&self.health),
+            )
+            .await
+            {
                 Ok(u) => {
                     if attempt > 0 {
                         metrics::counter!("purroute_upstream_retries_total").increment(1);
@@ -3360,7 +3406,8 @@ mod proxy_cov2 {
             let mut found = None;
             for candidate in 20000..30000 {
                 if let Ok(l_a) = TcpListener::bind(format!("127.0.0.1:{}", candidate)).await {
-                    if let Ok(l_b) = TcpListener::bind(format!("127.0.0.1:{}", candidate + 1)).await {
+                    if let Ok(l_b) = TcpListener::bind(format!("127.0.0.1:{}", candidate + 1)).await
+                    {
                         found = Some((l_a, l_b, candidate, candidate + 1));
                         break;
                     }
@@ -3423,7 +3470,11 @@ mod proxy_cov2 {
         let srv = Arc::new(ProxyServer::new(
             vec![proxy],
             None,
-            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(StatsDisplay::new(
+                get_global_stats(),
+                Duration::from_secs(1),
+                None,
+            )),
             Arc::new(router_cfg),
             Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
         ));
@@ -3441,7 +3492,10 @@ mod proxy_cov2 {
         assert_eq!(sel, [0x05, 0x00]);
 
         // SOCKS5 connect to 127.0.0.1:80
-        client.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80]).await.unwrap();
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
         let mut rep = [0u8; 10];
         client.read_exact(&mut rep).await.unwrap();
         assert_eq!(rep[1], 0x00, "Connection should succeed via retry");
@@ -3458,9 +3512,11 @@ mod proxy_cov2 {
         p.password_prefixes = Some(prefixes);
 
         let srv = mk(vec![p], None, Some("test"), vec![], false);
-        let mut sel = crate::routing::Selection::default();
-        sel.country = vec!["us".into()];
-        sel.session = Some("sess456".into());
+        let sel = crate::routing::Selection {
+            country: vec!["us".into()],
+            session: Some("sess456".into()),
+            ..Default::default()
+        };
 
         let chain = srv.resolve_proxy_chain_excluded(&sel, &[], &[]).unwrap();
         assert_eq!(
@@ -3478,16 +3534,22 @@ mod proxy_cov2 {
         let mut p2 = px("gw-b", Proxy::Socks5, "127.0.0.1:1081".parse().unwrap());
         p2.priority = Some(5);
 
-        let mut router_cfg = RouterConfig::default();
-        router_cfg.selection = Some(RouterSelectionConfig {
-            mode: "priority".into(),
-            pinned_label: None,
-        });
+        let router_cfg = RouterConfig {
+            selection: Some(RouterSelectionConfig {
+                mode: "priority".into(),
+                pinned_label: None,
+            }),
+            ..Default::default()
+        };
 
         let srv = Arc::new(ProxyServer::new(
             vec![p1, p2],
             None,
-            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(StatsDisplay::new(
+                get_global_stats(),
+                Duration::from_secs(1),
+                None,
+            )),
             Arc::new(router_cfg),
             Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
         ));
@@ -3499,7 +3561,9 @@ mod proxy_cov2 {
         assert_eq!(chain[0].port, Some(1081));
 
         // When port 1081 fails, excludes it and fails over to p1 (port 1080)
-        let chain_retry = srv.resolve_proxy_chain_excluded(&sel, &[1081], &[]).unwrap();
+        let chain_retry = srv
+            .resolve_proxy_chain_excluded(&sel, &[1081], &[])
+            .unwrap();
         assert_eq!(chain_retry[0].port, Some(1080));
     }
 
@@ -3512,16 +3576,22 @@ mod proxy_cov2 {
         let mut p2 = px("gw-b", Proxy::Socks5, "10.0.0.2:1080".parse().unwrap());
         p2.priority = Some(20);
 
-        let mut router_cfg = RouterConfig::default();
-        router_cfg.selection = Some(RouterSelectionConfig {
-            mode: "priority".into(),
-            pinned_label: None,
-        });
+        let router_cfg = RouterConfig {
+            selection: Some(RouterSelectionConfig {
+                mode: "priority".into(),
+                pinned_label: None,
+            }),
+            ..Default::default()
+        };
 
         let srv = Arc::new(ProxyServer::new(
             vec![p1, p2],
             None,
-            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(StatsDisplay::new(
+                get_global_stats(),
+                Duration::from_secs(1),
+                None,
+            )),
             Arc::new(router_cfg),
             Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
         ));
@@ -3535,7 +3605,9 @@ mod proxy_cov2 {
 
         // When gw-a (10.0.0.1:1080) fails, gw-b (10.0.0.2:1080) is NOT excluded despite sharing port 1080
         let excluded_endpoints = vec![("10.0.0.1".to_string(), 1080)];
-        let chain_retry = srv.resolve_proxy_chain_excluded(&sel, &[], &excluded_endpoints).unwrap();
+        let chain_retry = srv
+            .resolve_proxy_chain_excluded(&sel, &[], &excluded_endpoints)
+            .unwrap();
         assert_eq!(chain_retry[0].label.as_deref(), Some("gw-b"));
         assert_eq!(chain_retry[0].port, Some(1080));
     }
@@ -3547,16 +3619,22 @@ mod proxy_cov2 {
         let p1 = px("gw-a", Proxy::Socks5, "127.0.0.1:1080".parse().unwrap());
         let p2 = px("gw-b", Proxy::Socks5, "127.0.0.1:1081".parse().unwrap());
 
-        let mut router_cfg = RouterConfig::default();
-        router_cfg.selection = Some(RouterSelectionConfig {
-            mode: "pinned".into(),
-            pinned_label: Some("gw-b".into()),
-        });
+        let router_cfg = RouterConfig {
+            selection: Some(RouterSelectionConfig {
+                mode: "pinned".into(),
+                pinned_label: Some("gw-b".into()),
+            }),
+            ..Default::default()
+        };
 
         let srv = Arc::new(ProxyServer::new(
             vec![p1, p2],
             None,
-            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(StatsDisplay::new(
+                get_global_stats(),
+                Duration::from_secs(1),
+                None,
+            )),
             Arc::new(router_cfg),
             Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
         ));
@@ -3641,7 +3719,11 @@ mod proxy_cov2 {
         let srv = Arc::new(ProxyServer::new(
             vec![p1, p2],
             None,
-            Arc::new(StatsDisplay::new(get_global_stats(), Duration::from_secs(1), None)),
+            Arc::new(StatsDisplay::new(
+                get_global_stats(),
+                Duration::from_secs(1),
+                None,
+            )),
             Arc::new(router_cfg),
             Arc::new(crate::auth::StaticAuthBackend::new(&[]).unwrap()),
         ));
@@ -3656,9 +3738,15 @@ mod proxy_cov2 {
         assert_eq!(sel, [0x05, 0x00]);
 
         // SOCKS5 connect to 127.0.0.1:80
-        client.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80]).await.unwrap();
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
         let mut rep = [0u8; 10];
         client.read_exact(&mut rep).await.unwrap();
-        assert_eq!(rep[1], 0x00, "Connection should succeed via failover to secondary candidate");
+        assert_eq!(
+            rep[1], 0x00,
+            "Connection should succeed via failover to secondary candidate"
+        );
     }
 }
