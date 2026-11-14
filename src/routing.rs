@@ -1212,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn build_password_formats_evomi_full_targeting_suite() {
+    fn build_password_formats_upstream_full_targeting_suite() {
         let mut prefixes = std::collections::BTreeMap::new();
         prefixes.insert("country".into(), "country-".into());
         prefixes.insert("state".into(), "region-".into());

@@ -455,4 +455,30 @@ mod tests {
         prober_handle.abort();
         assert!(recovered, "Port should be recovered by active prober");
     }
+
+    #[tokio::test]
+    async fn test_active_health_prober_handles_failure() {
+        use std::sync::Arc;
+
+        let config = UpstreamHealthConfig {
+            failure_threshold: 1,
+            cooldown_secs: 0,
+            active_probe_interval_secs: 1,
+            recovery_mode: "active".to_string(),
+            ..Default::default()
+        };
+        let tracker = Arc::new(UpstreamHealthTracker::new(config));
+        // Use an unused port that immediately fails connection
+        tracker.record_failure("127.0.0.1", 1);
+        assert!(!tracker.is_healthy("127.0.0.1", 1));
+
+        let tracker_clone = Arc::clone(&tracker);
+        let prober_handle = tokio::spawn(async move {
+            run_active_health_prober(tracker_clone, vec![]).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        prober_handle.abort();
+        assert!(!tracker.is_healthy("127.0.0.1", 1));
+    }
 }
