@@ -356,6 +356,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_probe_upstream_port_with_auth() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 128];
+                // greeting with auth offered (0x02)
+                let n = socket.read(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], &[0x05, 0x02, 0x00, 0x02]);
+                socket.write_all(&[0x05, 0x02]).await.unwrap();
+
+                // read username/password auth
+                let _ = socket.read(&mut buf).await.unwrap();
+                assert_eq!(buf[0], 0x01); // version 1
+                let ulen = buf[1] as usize;
+                let user = std::str::from_utf8(&buf[2..2 + ulen]).unwrap();
+                let plen = buf[2 + ulen] as usize;
+                let pass = std::str::from_utf8(&buf[3 + ulen..3 + ulen + plen]).unwrap();
+                assert_eq!(user, "testuser");
+                assert_eq!(pass, "testpass");
+
+                // auth success
+                socket.write_all(&[0x01, 0x00]).await.unwrap();
+
+                // connect request
+                let _ = socket.read(&mut buf).await.unwrap();
+                socket
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let success = probe_upstream_port(
+            "127.0.0.1",
+            port,
+            Some(("testuser", "testpass")),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(success);
+    }
+
+    #[tokio::test]
     async fn test_active_health_prober_revives_dead_port() {
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
