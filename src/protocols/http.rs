@@ -262,6 +262,10 @@ mod http_cov {
             tags: Tags::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 
@@ -588,6 +592,10 @@ mod http_cov2 {
             tags: Tags::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 

@@ -78,6 +78,10 @@ fn build_proxy(
         },
         cost_per_byte,
         username_prefixes: None,
+        password_prefixes: None,
+        token_delimiter: None,
+        priority: None,
+        weight: None,
     }
 }
 

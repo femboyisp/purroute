@@ -202,7 +202,11 @@ pub async fn probe_upstream_port(
         Some(())
     };
 
-    timeout(timeout_dur, probe_fut).await.ok().flatten().is_some()
+    timeout(timeout_dur, probe_fut)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Background loop that periodically probes dead upstream ports when `recovery_mode == "active"`.
@@ -235,10 +239,12 @@ pub async fn run_active_health_prober(
 
             let alive = probe_upstream_port(&host, port, auth, Duration::from_secs(2)).await;
             if alive {
-                metrics::counter!("purroute_upstream_health_probes_total", "result" => "success").increment(1);
+                metrics::counter!("purroute_upstream_health_probes_total", "result" => "success")
+                    .increment(1);
                 tracker.record_success(&host, port);
             } else {
-                metrics::counter!("purroute_upstream_health_probes_total", "result" => "failure").increment(1);
+                metrics::counter!("purroute_upstream_health_probes_total", "result" => "failure")
+                    .increment(1);
                 // Reset cooldown timer
                 let mut map = tracker.ports.write();
                 if let Some(state) = map.get_mut(&(host, port)) {
@@ -333,7 +339,10 @@ mod tests {
                 // connect
                 let n = socket.read(&mut buf).await.unwrap();
                 assert_eq!(&buf[..n], &[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
-                socket.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                socket
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
             }
         });
 
@@ -341,8 +350,57 @@ mod tests {
         assert!(success);
 
         // A dead port that drops connection
-        let dead_success = probe_upstream_port("127.0.0.1", port + 9999, None, Duration::from_millis(50)).await;
+        let dead_success =
+            probe_upstream_port("127.0.0.1", port + 9999, None, Duration::from_millis(50)).await;
         assert!(!dead_success);
+    }
+
+    #[tokio::test]
+    async fn test_probe_upstream_port_with_auth() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 128];
+                // greeting with auth offered (0x02)
+                let n = socket.read(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], &[0x05, 0x02, 0x00, 0x02]);
+                socket.write_all(&[0x05, 0x02]).await.unwrap();
+
+                // read username/password auth
+                let _ = socket.read(&mut buf).await.unwrap();
+                assert_eq!(buf[0], 0x01); // version 1
+                let ulen = buf[1] as usize;
+                let user = std::str::from_utf8(&buf[2..2 + ulen]).unwrap();
+                let plen = buf[2 + ulen] as usize;
+                let pass = std::str::from_utf8(&buf[3 + ulen..3 + ulen + plen]).unwrap();
+                assert_eq!(user, "testuser");
+                assert_eq!(pass, "testpass");
+
+                // auth success
+                socket.write_all(&[0x01, 0x00]).await.unwrap();
+
+                // connect request
+                let _ = socket.read(&mut buf).await.unwrap();
+                socket
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let success = probe_upstream_port(
+            "127.0.0.1",
+            port,
+            Some(("testuser", "testpass")),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(success);
     }
 
     #[tokio::test]
@@ -360,7 +418,9 @@ mod tests {
                 let _ = socket.read(&mut buf).await;
                 let _ = socket.write_all(&[0x05, 0x00]).await;
                 let _ = socket.read(&mut buf).await;
-                let _ = socket.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                let _ = socket
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
             }
         });
 
@@ -394,5 +454,31 @@ mod tests {
         }
         prober_handle.abort();
         assert!(recovered, "Port should be recovered by active prober");
+    }
+
+    #[tokio::test]
+    async fn test_active_health_prober_handles_failure() {
+        use std::sync::Arc;
+
+        let config = UpstreamHealthConfig {
+            failure_threshold: 1,
+            cooldown_secs: 0,
+            active_probe_interval_secs: 1,
+            recovery_mode: "active".to_string(),
+            ..Default::default()
+        };
+        let tracker = Arc::new(UpstreamHealthTracker::new(config));
+        // Use an unused port that immediately fails connection
+        tracker.record_failure("127.0.0.1", 1);
+        assert!(!tracker.is_healthy("127.0.0.1", 1));
+
+        let tracker_clone = Arc::clone(&tracker);
+        let prober_handle = tokio::spawn(async move {
+            run_active_health_prober(tracker_clone, vec![]).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        prober_handle.abort();
+        assert!(!tracker.is_healthy("127.0.0.1", 1));
     }
 }

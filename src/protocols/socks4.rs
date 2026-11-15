@@ -273,6 +273,10 @@ mod socks4_cov {
             tags: Default::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 
@@ -518,6 +522,10 @@ mod socks4_cov2 {
             tags: Default::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 

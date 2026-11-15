@@ -22,7 +22,7 @@ impl ChainConnector {
     ///
     /// # Returns
     /// The TCP stream connected to the final destination through the chain
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub async fn connect_chain(
         chain: &[ProxyConfig],
         target_host: &str,
@@ -350,6 +350,10 @@ mod chain_cov {
             tags: Tags::default(),
             cost_per_byte: 1.0,
             username_prefixes: None,
+            password_prefixes: None,
+            token_delimiter: None,
+            priority: None,
+            weight: None,
         }
     }
 

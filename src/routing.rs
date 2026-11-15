@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::Tags;
+use crate::config::{ProxyConfig, RouterSelectionConfig, Tags};
 
 /// Recognised routing keys. The base username ends at the first one of these
 /// that is followed by a value.
@@ -91,20 +91,35 @@ impl Selection {
     }
 
     /// Like [`matches`](Self::matches) but an upstream that *templates* a
-    /// dimension (has a `username_prefixes` entry for it) serves any value for
-    /// that dimension, so the tag check is skipped for it.
+    /// dimension (has a `username_prefixes` or `password_prefixes` entry for it)
+    /// serves any value for that dimension, so the tag check is skipped for it.
+    #[allow(dead_code, clippy::allow_attributes)]
     pub fn matches_upstream(
         &self,
         tags: &Tags,
         prefixes: Option<&BTreeMap<String, String>>,
     ) -> bool {
-        let templated = |dim: &str| prefixes.is_some_and(|p| p.contains_key(dim));
+        self.matches_upstream_all(tags, prefixes, None)
+    }
+
+    /// Check whether an upstream satisfies the selection, treating dimensions
+    /// configured in either `username_prefixes` or `password_prefixes` as templated.
+    pub fn matches_upstream_all(
+        &self,
+        tags: &Tags,
+        username_prefixes: Option<&BTreeMap<String, String>>,
+        password_prefixes: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        let templated = |dim: &str| {
+            username_prefixes.is_some_and(|p| p.contains_key(dim))
+                || password_prefixes.is_some_and(|p| p.contains_key(dim))
+        };
         (templated("country") || dim_ok(&self.country, &tags.country))
             && (templated("state") || dim_ok(&self.state, &tags.state))
             && (templated("city") || dim_ok(&self.city, &tags.city))
             && (templated("postal") || dim_ok(&self.postal, &tags.postal))
             && (templated("isp") || dim_ok(&self.isp, &tags.isp))
-            && dim_ok(&self.kind, &tags.kind)
+            && (templated("kind") || templated("type") || dim_ok(&self.kind, &tags.kind))
             && asn_ok(self.asn, tags.asn)
     }
 }
@@ -392,8 +407,65 @@ pub fn build_username(base: &str, prefixes: &BTreeMap<String, String>, sel: &Sel
     out
 }
 
+/// Format an upstream password string by injecting routing selection dimensions.
+pub fn build_password(
+    base: &str,
+    prefixes: &BTreeMap<String, String>,
+    delimiter: Option<&str>,
+    selection: &Selection,
+) -> String {
+    let delim = delimiter.unwrap_or("_");
+    let mut tokens = Vec::new();
+
+    if let (Some(prefix), Some(c)) = (prefixes.get("country"), selection.country.first()) {
+        tokens.push(format!(
+            "{}{}",
+            prefix.trim_start_matches('-'),
+            c.to_ascii_uppercase()
+        ));
+    }
+    if let (Some(prefix), Some(s)) = (prefixes.get("state"), selection.state.first()) {
+        tokens.push(format!(
+            "{}{}",
+            prefix.trim_start_matches('-'),
+            s.to_ascii_uppercase()
+        ));
+    }
+    if let (Some(prefix), Some(c)) = (prefixes.get("city"), selection.city.first()) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), c));
+    }
+    if let (Some(prefix), Some(i)) = (prefixes.get("isp"), selection.isp.first()) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), i));
+    }
+    if let (Some(prefix), Some(k)) = (
+        prefixes.get("kind").or_else(|| prefixes.get("type")),
+        selection.kind.first(),
+    ) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), k));
+    }
+    if let (Some(prefix), Some(s)) = (prefixes.get("session"), &selection.session) {
+        tokens.push(format!(
+            "{}{}",
+            prefix.trim_start_matches('-'),
+            clamp_session_id(s)
+        ));
+    }
+    if let (Some(prefix), Some(l)) = (prefixes.get("lifetime"), &selection.lifetime) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), l));
+    }
+    if let (Some(prefix), Some(st)) = (prefixes.get("strict"), &selection.strict) {
+        tokens.push(format!("{}{}", prefix.trim_start_matches('-'), st));
+    }
+
+    if tokens.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{}{}{}", base, delim, tokens.join(delim))
+    }
+}
+
 /// Pick one port from an inclusive range: sticky by `session`, else random.
-#[expect(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn pick_port(range: (u16, u16), session: Option<&str>) -> u16 {
     let len = u32::from(range.1.saturating_sub(range.0)) + 1;
     let idx = pick_index(len as usize, session).unwrap_or(0);
@@ -460,7 +532,7 @@ pub fn pick_index(len: usize, session: Option<&str>) -> Option<usize> {
 }
 
 /// Small stable hash (FNV-1a, 64-bit) so the same session id pins the same exit.
-fn fnv1a(s: &str) -> u64 {
+pub fn fnv1a(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         hash ^= u64::from(*b);
@@ -469,9 +541,165 @@ fn fnv1a(s: &str) -> u64 {
     hash
 }
 
+/// Pick one upstream candidate index according to the configured selection strategy.
+pub fn pick_candidate_index(
+    candidates: &[ProxyConfig],
+    selection: &Selection,
+    strategy: &RouterSelectionConfig,
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    match strategy.mode.as_str() {
+        "pinned" => {
+            if let Some(target) = &strategy.pinned_label {
+                candidates
+                    .iter()
+                    .position(|p| p.label.as_deref() == Some(target))
+            } else {
+                Some(0)
+            }
+        }
+        "priority" => candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX))
+            .map(|(idx, _)| idx),
+        _ => {
+            // Weighted selection (default)
+            let total_weight: u32 = candidates
+                .iter()
+                .map(|p| p.weight.unwrap_or(1).max(1))
+                .sum();
+            if let Some(sess) = &selection.session {
+                // Deterministic sticky weighted selection using session hash
+                let mut hash_val = (fnv1a(sess) % (total_weight as u64)) as u32;
+                for (i, p) in candidates.iter().enumerate() {
+                    let w = p.weight.unwrap_or(1).max(1);
+                    if hash_val < w {
+                        return Some(i);
+                    }
+                    hash_val -= w;
+                }
+                Some(0)
+            } else {
+                let mut rng_val = rand::random::<u32>() % total_weight;
+                for (i, p) in candidates.iter().enumerate() {
+                    let w = p.weight.unwrap_or(1).max(1);
+                    if rng_val < w {
+                        return Some(i);
+                    }
+                    rng_val -= w;
+                }
+                Some(0)
+            }
+        }
+    }
+}
+
+#[allow(clippy::allow_attributes, unused_imports, dead_code)]
+pub use pick_candidate_index as pick_upstream_candidate;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ProxyConfig, RouterSelectionConfig};
+
+    #[test]
+    fn test_pick_upstream_priority_mode() {
+        let mut p1 = ProxyConfig::default_for_test();
+        p1.priority = Some(20);
+        p1.label = Some("low-priority".into());
+
+        let mut p2 = ProxyConfig::default_for_test();
+        p2.priority = Some(5);
+        p2.label = Some("high-priority".into());
+
+        let candidates = vec![p1, p2];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig {
+            mode: "priority".into(),
+            pinned_label: None,
+        };
+
+        let idx = pick_candidate_index(&candidates, &sel, &strategy);
+        assert_eq!(idx, Some(1)); // p2 has lower priority number (higher rank)
+    }
+
+    #[test]
+    fn test_pick_upstream_pinned_mode() {
+        let mut p1 = ProxyConfig::default_for_test();
+        p1.label = Some("gw-a".into());
+
+        let mut p2 = ProxyConfig::default_for_test();
+        p2.label = Some("gw-b".into());
+
+        let candidates = vec![p1, p2];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: Some("gw-b".into()),
+        };
+
+        let idx = pick_candidate_index(&candidates, &sel, &strategy);
+        assert_eq!(idx, Some(1));
+    }
+
+    #[test]
+    fn test_pick_upstream_pinned_missing_label() {
+        let p1 = ProxyConfig::default_for_test();
+        let candidates = vec![p1];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: Some("non-existent".into()),
+        };
+        assert_eq!(pick_candidate_index(&candidates, &sel, &strategy), None);
+
+        let strategy_none = RouterSelectionConfig {
+            mode: "pinned".into(),
+            pinned_label: None,
+        };
+        assert_eq!(
+            pick_candidate_index(&candidates, &sel, &strategy_none),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_pick_upstream_weighted_mode() {
+        let mut p1 = ProxyConfig::default_for_test();
+        p1.weight = Some(10);
+        let mut p2 = ProxyConfig::default_for_test();
+        p2.weight = Some(20);
+
+        let candidates = vec![p1, p2];
+        let strategy = RouterSelectionConfig::default(); // mode: "weighted"
+
+        // Random pick without session should always return valid index
+        let sel_no_sess = Selection::default();
+        let idx = pick_candidate_index(&candidates, &sel_no_sess, &strategy);
+        assert!(idx == Some(0) || idx == Some(1));
+
+        // Deterministic sticky selection with session
+        let sel_sess = Selection {
+            session: Some("sticky-abc".into()),
+            ..Default::default()
+        };
+        let idx_a = pick_candidate_index(&candidates, &sel_sess, &strategy);
+        let idx_b = pick_candidate_index(&candidates, &sel_sess, &strategy);
+        assert_eq!(idx_a, idx_b);
+        assert!(idx_a.is_some());
+    }
+
+    #[test]
+    fn test_pick_upstream_empty_candidates() {
+        let candidates: Vec<ProxyConfig> = vec![];
+        let sel = Selection::default();
+        let strategy = RouterSelectionConfig::default();
+        assert_eq!(pick_candidate_index(&candidates, &sel, &strategy), None);
+    }
 
     fn tags(country: &str, isp: &str, kind: &str) -> Tags {
         Tags {
@@ -649,8 +877,10 @@ mod tests {
         // Mark that chosen port dead:
         tracker.record_failure("proxy.socks.cat", normal);
 
-        let fallback_1 = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
-        let fallback_2 = pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+        let fallback_1 =
+            pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
+        let fallback_2 =
+            pick_port_healthy("proxy.socks.cat", range, Some("sess-123"), &tracker, &[]);
 
         assert_ne!(normal, fallback_1);
         assert_eq!(fallback_1, fallback_2); // Consistent fallback across requests!
@@ -723,6 +953,58 @@ mod tests {
         // Exactly one of the three countries is chosen, deterministically.
         assert_eq!(u, build_username("BASE", &prefixes, &sel));
         assert!(["BASE-country-us", "BASE-country-de", "BASE-country-fr"].contains(&u.as_str()));
+    }
+
+    #[test]
+    fn test_build_password_with_underscore_delimiter() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+        prefixes.insert("session".into(), "-session-".into());
+
+        let selection = Selection {
+            country: vec!["us".into()],
+            session: Some("sess123".into()),
+            ..Default::default()
+        };
+
+        let result = build_password("mypassword", &prefixes, Some("_"), &selection);
+        assert_eq!(result, "mypassword_country-US_session-sess123");
+    }
+
+    #[test]
+    fn test_build_password_empty_selection_keeps_base() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+
+        let selection = Selection::default();
+        let result = build_password("mypassword", &prefixes, Some("_"), &selection);
+        assert_eq!(result, "mypassword");
+    }
+
+    #[test]
+    fn test_build_password_all_dimensions_and_default_delimiter() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("country".into(), "-country-".into());
+        prefixes.insert("state".into(), "-state-".into());
+        prefixes.insert("city".into(), "-city-".into());
+        prefixes.insert("isp".into(), "-isp-".into());
+        prefixes.insert("session".into(), "session-".into());
+
+        let selection = Selection {
+            country: vec!["us".into()],
+            state: vec!["ca".into()],
+            city: vec!["losangeles".into()],
+            isp: vec!["comcast".into()],
+            session: Some("sess999".into()),
+            ..Default::default()
+        };
+
+        // Default delimiter is "_" when None
+        let result = build_password("basepass", &prefixes, None, &selection);
+        assert_eq!(
+            result,
+            "basepass_country-US_state-CA_city-losangeles_isp-comcast_session-sess999"
+        );
     }
 
     #[test]
@@ -815,5 +1097,198 @@ mod tests {
             None,
             &auth_scope(username),
         ));
+    }
+
+    #[test]
+    fn test_pick_candidate_index_sticky_weighted_distribution() {
+        use crate::protocols::Proxy;
+
+        let p0 = ProxyConfig {
+            label: Some("heavy".into()),
+            proxy_type: Proxy::Socks5,
+            address: "10.0.0.1".into(),
+            port: Some(1080),
+            port_range: None,
+            username: None,
+            password: None,
+            token_delimiter: None,
+            username_prefixes: None,
+            password_prefixes: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            priority: None,
+            weight: Some(90),
+        };
+        let p1 = ProxyConfig {
+            label: Some("light".into()),
+            proxy_type: Proxy::Socks5,
+            address: "10.0.0.2".into(),
+            port: Some(1080),
+            port_range: None,
+            username: None,
+            password: None,
+            token_delimiter: None,
+            username_prefixes: None,
+            password_prefixes: None,
+            tags: Tags::default(),
+            cost_per_byte: 1.0,
+            priority: None,
+            weight: Some(10),
+        };
+        let candidates = vec![p0, p1];
+        let strategy = RouterSelectionConfig {
+            mode: "weighted".into(),
+            pinned_label: None,
+        };
+
+        let mut count0 = 0;
+        let mut count1 = 0;
+        let total = 1000;
+
+        for i in 0..total {
+            let sess = format!("session_key_{i}");
+            let sel = Selection {
+                session: Some(sess.clone()),
+                ..Default::default()
+            };
+
+            let idx1 = pick_candidate_index(&candidates, &sel, &strategy).unwrap();
+            let idx2 = pick_candidate_index(&candidates, &sel, &strategy).unwrap();
+            // Consistent stickiness
+            assert_eq!(idx1, idx2);
+
+            if idx1 == 0 {
+                count0 += 1;
+            } else {
+                count1 += 1;
+            }
+        }
+
+        // 90/10 distribution with 1000 trials should reliably land near 900 / 100
+        assert!(
+            count0 > 800,
+            "expected candidate 0 (weight 90) to get > 80% picks, got {count0}/{total}"
+        );
+        assert!(
+            count1 < 200,
+            "expected candidate 1 (weight 10) to get < 20% picks, got {count1}/{total}"
+        );
+    }
+
+    #[test]
+    fn test_build_password_session_sanitization() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("session".into(), "-session-".into());
+
+        let selection = Selection {
+            session: Some("evil;pass_delims!@#".into()),
+            ..Default::default()
+        };
+
+        let result = build_password("basepass", &prefixes, Some("_"), &selection);
+        // clamp_session_id should hash any string containing non-[A-Za-z0-9_] characters
+        assert!(!result.contains(';'));
+        assert!(!result.contains('!'));
+        assert!(!result.contains('@'));
+        assert!(result.starts_with("basepass_session-s"));
+    }
+
+    #[test]
+    fn test_build_password_kind_lifetime_strict() {
+        let mut prefixes = BTreeMap::new();
+        prefixes.insert("kind".into(), "-type-".into());
+        prefixes.insert("lifetime".into(), "-life-".into());
+        prefixes.insert("strict".into(), "-strict-".into());
+
+        let selection = Selection {
+            kind: vec!["residential".into()],
+            lifetime: Some("30".into()),
+            strict: Some("1".into()),
+            ..Default::default()
+        };
+
+        let result = build_password("basepass", &prefixes, Some("_"), &selection);
+        assert_eq!(result, "basepass_type-residential_life-30_strict-1");
+    }
+
+    #[test]
+    fn build_password_formats_upstream_full_targeting_suite() {
+        let mut prefixes = std::collections::BTreeMap::new();
+        prefixes.insert("country".into(), "country-".into());
+        prefixes.insert("state".into(), "region-".into());
+        prefixes.insert("city".into(), "city-".into());
+        prefixes.insert("isp".into(), "isp-".into());
+        prefixes.insert("session".into(), "session-".into());
+        prefixes.insert("lifetime".into(), "lifetime-".into());
+
+        let selection = Selection {
+            country: vec!["us".into()],
+            state: vec!["ca".into()],
+            city: vec!["losangeles".into()],
+            isp: vec!["7922".into()],
+            kind: vec![],
+            asn: None,
+            session: Some("work1".into()),
+            lifetime: Some("30".into()),
+            strict: None,
+            chain: None,
+            postal: vec![],
+        };
+
+        let pw = build_password("basepass", &prefixes, Some("_"), &selection);
+        assert_eq!(
+            pw,
+            "basepass_country-US_region-CA_city-losangeles_isp-7922_session-work1_lifetime-30"
+        );
+    }
+
+    #[test]
+    fn test_selection_helpers_is_empty_only_session_and_matches() {
+        let empty = Selection::default();
+        assert!(empty.is_empty());
+        assert!(empty.only_session());
+
+        let with_session = Selection {
+            session: Some("sess1".into()),
+            ..Default::default()
+        };
+        assert!(!with_session.is_empty());
+        assert!(with_session.only_session());
+
+        let with_country = Selection {
+            country: vec!["us".into()],
+            ..Default::default()
+        };
+        assert!(!with_country.is_empty());
+        assert!(!with_country.only_session());
+
+        let tags = Tags {
+            country: Some("us".into()),
+            state: Some("ca".into()),
+            city: Some("la".into()),
+            postal: Some("90001".into()),
+            isp: Some("comcast".into()),
+            kind: Some("residential".into()),
+            asn: Some(7922),
+        };
+        assert!(empty.matches(&tags));
+
+        let matching_sel = Selection {
+            country: vec!["us".into()],
+            state: vec!["ca".into()],
+            city: vec!["la".into()],
+            postal: vec!["90001".into()],
+            isp: vec!["comcast".into()],
+            kind: vec!["residential".into()],
+            asn: Some(7922),
+            ..Default::default()
+        };
+        assert!(matching_sel.matches(&tags));
+
+        let mismatch_sel = Selection {
+            country: vec!["de".into()],
+            ..Default::default()
+        };
+        assert!(!mismatch_sel.matches(&tags));
     }
 }
