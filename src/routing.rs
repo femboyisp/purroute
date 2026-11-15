@@ -1241,4 +1241,54 @@ mod tests {
             "basepass_country-US_region-CA_city-losangeles_isp-7922_session-work1_lifetime-30"
         );
     }
+
+    #[test]
+    fn test_selection_helpers_is_empty_only_session_and_matches() {
+        let empty = Selection::default();
+        assert!(empty.is_empty());
+        assert!(empty.only_session());
+
+        let with_session = Selection {
+            session: Some("sess1".into()),
+            ..Default::default()
+        };
+        assert!(!with_session.is_empty());
+        assert!(with_session.only_session());
+
+        let with_country = Selection {
+            country: vec!["us".into()],
+            ..Default::default()
+        };
+        assert!(!with_country.is_empty());
+        assert!(!with_country.only_session());
+
+        let tags = Tags {
+            country: Some("us".into()),
+            state: Some("ca".into()),
+            city: Some("la".into()),
+            postal: Some("90001".into()),
+            isp: Some("comcast".into()),
+            kind: Some("residential".into()),
+            asn: Some(7922),
+        };
+        assert!(empty.matches(&tags));
+
+        let matching_sel = Selection {
+            country: vec!["us".into()],
+            state: vec!["ca".into()],
+            city: vec!["la".into()],
+            postal: vec!["90001".into()],
+            isp: vec!["comcast".into()],
+            kind: vec!["residential".into()],
+            asn: Some(7922),
+            ..Default::default()
+        };
+        assert!(matching_sel.matches(&tags));
+
+        let mismatch_sel = Selection {
+            country: vec!["de".into()],
+            ..Default::default()
+        };
+        assert!(!mismatch_sel.matches(&tags));
+    }
 }
